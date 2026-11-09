@@ -62,6 +62,9 @@ jobs:
     needs: build
     if: needs.build.outputs.version != ''
     runs-on: ubuntu-latest
+    concurrency:
+      group: home-assistant-publish
+      queue: max
     permissions:
       contents: write
     steps:
@@ -99,3 +102,29 @@ jobs:
             gh release create "$VERSION" "${assets[@]}" --target "$GITHUB_SHA" \
               --title "$title" --notes "$notes" --latest="$latest" "${flags[@]}"
           fi
+      - name: Prune old Home Assistant releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          expired=$(gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" |
+            jq -r '
+              def version: "[0-9]+\\.[0-9]+\\.[0-9]+";
+              def beta: .prerelease and (.tag_name | test("^" + version + "-beta\\.[0-9]+$"));
+              def stable: (.prerelease | not) and (.tag_name | test("^" + version + "$"));
+
+              flatten(1)
+              | map(select(.draft == false and .published_at != null))
+              | sort_by(.published_at, .id)
+              | reverse
+              | (map(select(beta))[3:] + map(select(stable))[5:])
+              | .[]
+              | [.id, .tag_name]
+              | @tsv
+            ')
+          while IFS=$'\t' read -r id tag; do
+            [[ -n "$id" ]] || continue
+            echo "Deleting GitHub release $tag and keeping its Git tag"
+            gh api --method DELETE "repos/$GH_REPO/releases/$id"
+          done <<< "$expired"
