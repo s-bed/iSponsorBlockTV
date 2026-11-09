@@ -1,0 +1,101 @@
+name: Publish Home Assistant package
+
+on:
+  workflow_call:
+    inputs:
+      preview:
+        required: true
+        type: boolean
+    secrets:
+      release_token:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+      - name: Calculate release version
+        id: version
+        env:
+          PREVIEW: ${{ inputs.preview }}
+        run: |
+          args=()
+          if [[ "$PREVIEW" == true ]]; then
+            args+=(--preview "$GITHUB_RUN_NUMBER")
+          fi
+          version=$(python tools/home_assistant_version.py "${args[@]}")
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Test integration
+        if: steps.version.outputs.version != ''
+        run: |
+          python -m pip install -r tests/requirements.txt
+          python -m pytest -p pytest_homeassistant --asyncio-mode=auto tests
+      - name: Build release archives
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python tools/build_home_assistant.py --version "$VERSION" --hacs --output dist/isponsorblocktv.zip
+          python tools/build_home_assistant.py --version "$VERSION"
+      - uses: actions/upload-artifact@v7
+        if: steps.version.outputs.version != ''
+        with:
+          name: home-assistant-release
+          path: dist/*.zip
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: build
+    if: needs.build.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: home-assistant-release
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.release_token || github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIEW: ${{ inputs.preview }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          title="Home Assistant $VERSION"
+          notes="iSponsorBlockTV for Home Assistant 2026.11 or newer."
+          latest=true
+          flags=()
+          if [[ "$PREVIEW" == true ]]; then
+            title="$title ($GITHUB_REF_NAME)"
+            notes="Development build from branch $GITHUB_REF_NAME at $GITHUB_SHA."
+            latest=false
+            flags+=(--prerelease)
+          fi
+          assets=(dist/isponsorblocktv.zip dist/isponsorblocktv-home-assistant.zip)
+          if release=$(gh release view "$VERSION" --json isDraft,targetCommitish); then
+            if [[ "$(jq -r .isDraft <<< "$release")" == true ]]; then
+              test "$(jq -r .targetCommitish <<< "$release")" = "$GITHUB_SHA"
+              gh release upload "$VERSION" "${assets[@]}" --clobber
+              gh release edit "$VERSION" --draft=false --latest="$latest" "${flags[@]}"
+            else
+              test "$(gh api "repos/$GH_REPO/commits/$VERSION" --jq .sha)" = "$GITHUB_SHA"
+            fi
+          else
+            gh release create "$VERSION" "${assets[@]}" --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes" --latest="$latest" "${flags[@]}"
+          fi

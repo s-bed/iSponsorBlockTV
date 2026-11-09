@@ -1,0 +1,129 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Add a YouTube TV",
+        "description": "Choose how to link this TV.",
+        "menu_options": {
+          "tv_code": "YouTube TV code",
+          "existing_screen_id": "Existing screen ID"
+        }
+      },
+      "tv_code": {
+        "title": "Enter the YouTube TV code",
+        "description": "On the TV you want to link, open the YouTube app, go to **Settings → Link with TV code**, and enter the 12-digit code shown on the TV.",
+        "data": {"tv_code": "TV code"}
+      },
+      "existing_screen_id": {
+        "title": "Enter an existing screen ID",
+        "description": "Copy this TV's `screen_id` from the `devices` list in your iSponsorBlockTV `config.json`. You can also copy the TV's `name`.",
+        "data": {"screen_id": "Screen ID", "name": "TV name (optional)"}
+      },
+      "screen_id_rejected": {
+        "title": "Screen ID rejected",
+        "description": "YouTube rejected this screen ID. Get a fresh TV code from the YouTube app, or try another saved screen ID.",
+        "menu_options": {
+          "tv_code": "Use a YouTube TV code",
+          "existing_screen_id": "Try another screen ID"
+        }
+      },
+      "discovery_confirm": {
+        "title": "Discovered a YouTube TV",
+        "description": "Home Assistant found **{name}** on your network. Continue to check its YouTube pairing."
+      },
+      "confirm": {
+        "title": "Confirm the matched TV",
+        "description": "The YouTube pairing check succeeded. Submit to add **{name}**."
+      },
+      "name": {
+        "title": "Name the matched TV",
+        "description": "YouTube verified the pairing. Enter a name for this TV.",
+        "data": {"name": "TV name"}
+      },
+      "repair_confirm": {
+        "title": "Confirm the original TV",
+        "description": "The new code matched a different screen ID. Confirm that you got this code from the same TV you added as **{name}**.",
+        "data": {"same_tv": "I got this code from the original TV"}
+      }
+    },
+    "progress": {
+      "verify": "Checking the pairing with YouTube…"
+    },
+    "error": {
+      "cannot_connect": "YouTube could not verify the pairing right now. Try again.",
+      "invalid_code": "The TV code is invalid or expired. Enter the current 12-digit code shown on the TV.",
+      "name_required": "Enter a name for this TV.",
+      "confirm_original_tv": "Confirm the code came from the original TV to continue."
+    },
+    "abort": {
+      "already_configured": "This TV is already configured.",
+      "no_youtube_screen": "The TV did not expose a YouTube screen ID. You can add it with a TV code."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Skipping and playback settings",
+        "data": {
+          "skip_categories": "SponsorBlock categories",
+          "minimum_skip_length": "Minimum segment length",
+          "offset": "Skip timing offset",
+          "mute_ads": "Mute YouTube ads",
+          "skip_ads": "Skip YouTube ads when possible",
+          "auto_play": "Enable YouTube autoplay",
+          "skip_count_tracking": "Report viewed segments to SponsorBlock"
+        },
+        "data_description": {
+          "skip_categories": "Clear all categories to disable SponsorBlock skipping on this TV.",
+          "offset": "Use a positive value to send the seek command earlier."
+        },
+        "sections": {
+          "advanced": {
+            "name": "Advanced settings",
+            "data": {
+              "join_name": "Name shown in the YouTube app",
+              "sponsorblock_api_url": "SponsorBlock API URL",
+              "apikey": "YouTube Data API key",
+              "channel_whitelist": "Channels to exclude from SponsorBlock skipping",
+              "use_proxy": "Use the environment proxy"
+            },
+            "data_description": {
+              "channel_whitelist": "Enter the YouTube channel ID for each channel you want to exclude. Requires a YouTube Data API key."
+            }
+          }
+        }
+      }
+    },
+    "error": {
+      "api_key_required": "Enter a YouTube Data API key to exclude channels.",
+      "invalid_sponsorblock_url": "Enter a valid HTTP or HTTPS URL for the SponsorBlock API."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "youtube_connected": {"name": "YouTube connected"},
+      "pairing_problem": {"name": "Pairing problem"},
+      "ad_playing": {"name": "Ad playing"},
+      "ad_skippable": {"name": "Ad skippable"},
+      "muted": {"name": "Muted"}
+    },
+    "sensor": {
+      "playback_state": {
+        "name": "Playback state",
+        "state": {
+          "idle": "Idle",
+          "playing": "Playing",
+          "paused": "Paused",
+          "buffering": "Buffering"
+        }
+      },
+      "skip_count": {"name": "SponsorBlock skips since load"},
+      "last_skip": {"name": "Last SponsorBlock skip"},
+      "video_id": {"name": "Video ID"},
+      "duration": {"name": "Video duration"},
+      "playback_speed": {"name": "Playback speed"},
+      "volume": {"name": "Volume"}
+    }
+  }
+}

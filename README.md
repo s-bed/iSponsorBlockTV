@@ -15,6 +15,62 @@ available on YouTube ads.
 
 Check the [wiki](https://github.com/dmunozv04/iSponsorBlockTV/wiki/Installation)
 
+### Home Assistant custom integration
+
+On Home Assistant 2026.11 or newer, use the custom integration to run
+iSponsorBlockTV and configure each TV from the Home Assistant UI.
+
+1. From this repository, run `python3 tools/build_home_assistant.py`. Extract
+   `dist/isponsorblocktv-home-assistant.zip` into the Home Assistant configuration
+   directory so it contains `custom_components/isponsorblocktv/manifest.json`.
+2. Restart Home Assistant. In **Settings → Devices & services**, configure a
+   discovered iSponsorBlockTV device or select **Add integration → iSponsorBlockTV**.
+3. Choose **YouTube TV code** and enter the code shown under **Settings → Link
+   with TV code** in the YouTube app on your TV. If you already use the standalone
+   service, choose **Existing screen ID** and paste that TV's `screen_id` from
+   the `devices` list in `config.json`. Add each TV individually. Once Home
+   Assistant takes over a TV, remove that TV from the standalone service's
+   configuration or stop the standalone service if all TVs have moved.
+4. Open the TV's integration options to configure categories, ad handling, and
+   other settings for that TV.
+
+Automatic discovery uses local SSDP/DIAL and only offers TVs that expose a
+YouTube screen ID. Manual pairing works without local discovery. The
+**YouTube connected** sensor reflects the YouTube app connection. If YouTube
+rejects a saved pairing, use **Settings → System → Repairs** to enter a fresh TV
+code. **Reconfigure** on the TV's integration entry also lets you re-pair it.
+
+The TV exposes connection and pairing status, playback and ad state, and
+SponsorBlock skip activity. The skip count and last-skip timestamp cover the
+current integration load. Additional video and audio sensors can be enabled
+from the device page.
+
+#### Releases and previews
+
+Add the fork as a custom integration repository in Home Assistant Marketplace
+(formerly HACS). Stable updates use the latest production release. Turn on the
+repository's **Pre-release** switch to get previews. That switch applies to the
+repository, so check the branch named in the release title before installing.
+
+- Pushes to custom branches publish a prerelease such as `2.12.0-beta.23`.
+  Dependabot branches are excluded.
+- Merges and direct pushes to `main` publish a stable release such as `2.12.0`.
+  After the first release, a conventional commit with `!` or a
+  `BREAKING CHANGE:` footer bumps the major version. A `feat:` commit bumps the
+  minor version. Other changes bump the patch version. The workflow uses the
+  highest bump since the previous stable release. Use a conventional commit
+  title when squash-merging to carry the intended bump onto `main`.
+- Both workflows run the Home Assistant tests before publishing. The release
+  includes `isponsorblocktv.zip` for Marketplace and
+  `isponsorblocktv-home-assistant.zip` for manual installation.
+
+Use the production workflow for stable Home Assistant releases on this fork.
+Marketplace selects stable releases from the repository's shared GitHub
+release list. The workflows use GitHub's built-in token by default. If GitHub
+denies publishing a preview that changes workflow files, set the optional
+`HA_RELEASE_TOKEN` Actions secret for trusted branches to a repository-scoped
+token with **Contents** and **Workflows** write access.
+
 ## Compatibility
 
 Legend: ✅ = Working, ❌ = Not working, ❔ = Not tested
@@ -74,6 +130,15 @@ This code can be found in the settings page of your YouTube TV application.
 3. Commit your changes (`git commit -am 'Add some feature'`)
 4. Push to the branch (`git push origin my-new-feature`)
 5. Create a new Pull Request
+
+For Home Assistant tests, install the test dependencies in a Python 3.14 virtual
+environment and run the suite from the repository root. The tests unpack the
+same integration ZIP that Home Assistant installs.
+
+```sh
+python -m pip install -r tests/requirements.txt
+python -m pytest -p pytest_homeassistant --asyncio-mode=auto tests
+```
 
 ## Contributors
 

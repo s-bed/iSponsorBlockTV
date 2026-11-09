@@ -1,0 +1,24 @@
+name: Home Assistant development release
+
+on:
+  push:
+    branches:
+      - '**'
+      - '!main'
+      - '!dependabot/**'
+  workflow_dispatch:
+
+concurrency:
+  group: home-assistant-dev-${{ github.ref }}
+  queue: max
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/heads/') && github.ref_name != 'main' && !github.event.deleted
+    permissions:
+      contents: write
+    uses: ./.github/workflows/home-assistant-publish.yml
+    with:
+      preview: true
+    secrets:
+      release_token: ${{ secrets.HA_RELEASE_TOKEN }}

@@ -1,26 +1,23 @@
 import asyncio
 import logging
-import time
 from signal import SIGINT, SIGTERM, signal
-from typing import Optional
 
 import aiohttp
 
 from . import api_helpers, ytlounge
 from .debug_helpers import AiohttpTracer
+from .playback import PlaybackScheduler
 
 
 class DeviceListener:
     def __init__(self, api_helper, config, device, debug: bool, web_session):
-        self.task: Optional[asyncio.Task] = None
-        self.api_helper = api_helper
-        self.offset = device.offset
         self.name = device.name
-        self.cancelled = False
-        self.logger = logging.getLogger(f"iSponsorBlockTV-{device.screen_id}")
-        self.web_session = web_session
+        self.logger = logging.getLogger(f"iSponsorBlockTV-{device.name}")
         self.lounge_controller = ytlounge.YtLoungeApi(
-            device.screen_id, config, api_helper, self.logger
+            device.screen_id, config, api_helper, self.logger, web_session=web_session
+        )
+        self.playback = PlaybackScheduler(
+            api_helper, self.lounge_controller, device.offset, self.logger
         )
 
     # Ensures that we have a valid auth token
@@ -29,119 +26,36 @@ class DeviceListener:
             await asyncio.sleep(60 * 60 * 24)  # Refresh every 24 hours
             try:
                 await self.lounge_controller.refresh_auth()
-            except BaseException:
-                pass
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug(
+                    "Could not refresh YouTube authorization (%s)", type(err).__name__
+                )
 
-    async def is_available(self):
-        try:
-            return await self.lounge_controller.is_available()
-        except BaseException:
-            return False
-
-    # Main subscription loop
     async def loop(self):
         lounge_controller = self.lounge_controller
-        while not self.cancelled:
-            while not lounge_controller.linked():
-                try:
-                    self.logger.debug("Refreshing auth")
+        while True:
+            try:
+                if not lounge_controller.linked():
                     await lounge_controller.refresh_auth()
-                except BaseException:
-                    await asyncio.sleep(10)
-            while not (await self.is_available()) and not self.cancelled:
-                self.logger.debug("Waiting for device to be available")
-                await asyncio.sleep(10)
-            try:
-                await lounge_controller.connect()
-            except BaseException:
-                pass
-            while not lounge_controller.connected() and not self.cancelled:
-                # Doesn't connect to the device if it's a kids profile (it's broken)
-                self.logger.debug("Waiting for device to be connected")
-                await asyncio.sleep(10)
-                try:
-                    await lounge_controller.connect()
-                except BaseException:
-                    pass
-            self.logger.info(
-                "Connected to device %s (%s)", lounge_controller.screen_name, self.name
-            )
-            try:
-                self.logger.debug("Subscribing to lounge")
-                sub = await lounge_controller.subscribe_monitored(self)
-                await sub
-            except BaseException:
-                pass
-
-    # Method called on playback state change
-    async def __call__(self, state):
-        time_start = time.monotonic()
-        try:
-            self.task.cancel()
-        except BaseException:
-            pass
-        self.task = asyncio.create_task(self.process_playstatus(state, time_start))
-
-    # Processes the playback state change
-    async def process_playstatus(self, state, time_start):
-        segments = []
-        if state.videoId:
-            segments = await self.api_helper.get_segments(state.videoId)
-        if state.state.value == 1:  # Playing
-            self.logger.info("Playing video %s with %d segments", state.videoId, len(segments))
-            if segments:  # If there are segments
-                await self.time_to_segment(segments, state.currentTime, time_start)
-
-    # Finds the next segment to skip to and skips to it
-    async def time_to_segment(self, segments, position, time_start):
-        start_next_segment = None
-        next_segment = None
-        for segment in segments:
-            segment_start = segment["start"]
-            segment_end = segment["end"]
-            is_within_start_range = (
-                position < 1 < segment_end and segment_start <= position < segment_end
-            )
-            is_beyond_current_position = segment_start > position
-
-            if is_within_start_range or is_beyond_current_position:
-                next_segment = segment
-                start_next_segment = position if is_within_start_range else segment_start
-                break
-        if start_next_segment:
-            time_to_next = (
-                (start_next_segment - position - (time.monotonic() - time_start))
-                / self.lounge_controller.playback_speed
-            ) - self.offset
-            await self.skip(time_to_next, next_segment["end"], next_segment["UUID"])
-
-    # Skips to the next segment (waits for the time to pass)
-    async def skip(self, time_to, position, uuids):
-        await asyncio.sleep(time_to)
-        self.logger.info("Skipping segment: seeking to %s", position)
-        await asyncio.gather(
-            asyncio.create_task(self.lounge_controller.seek_to(position)),
-            asyncio.create_task(self.api_helper.mark_viewed_segments(uuids)),
-        )
+                if await lounge_controller.is_available() and await lounge_controller.connect():
+                    self.logger.info(
+                        "Connected to device %s (%s)", lounge_controller.screen_name, self.name
+                    )
+                    await lounge_controller.run_subscription(self.playback)
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug("YouTube Lounge connection failed (%s)", type(err).__name__)
+            finally:
+                await self.cancel()
+            await asyncio.sleep(10)
 
     async def cancel(self):
-        self.cancelled = True
-        await self.lounge_controller.disconnect()
-        if self.task:
-            self.task.cancel()
-        if self.lounge_controller.subscribe_task_watchdog:
-            self.lounge_controller.subscribe_task_watchdog.cancel()
-        if self.lounge_controller.subscribe_task:
-            self.lounge_controller.subscribe_task.cancel()
-        await asyncio.gather(
-            self.task,
-            self.lounge_controller.subscribe_task_watchdog,
-            self.lounge_controller.subscribe_task,
-            return_exceptions=True,
-        )
-
-    async def initialize_web_session(self):
-        await self.lounge_controller.change_web_session(self.web_session)
+        await self.lounge_controller.stop_subscription()
+        await self.playback.cancel()
+        try:
+            await self.lounge_controller.disconnect()
+        except Exception as err:  # noqa: BLE001
+            self.logger.debug("YouTube Lounge disconnect failed (%s)", type(err).__name__)
+        self.lounge_controller.reset_playback()
 
 
 async def finish(devices, web_session, tcp_connector):
@@ -182,7 +96,6 @@ async def main_async(config, debug, http_tracing):
     for i in config.devices:
         device = DeviceListener(api_helper, config, i, debug, web_session)
         devices.append(device)
-        await device.initialize_web_session()
         tasks.append(loop.create_task(device.loop()))
         tasks.append(loop.create_task(device.refresh_auth_loop()))
     signal(SIGTERM, handle_signal)
@@ -191,13 +104,12 @@ async def main_async(config, debug, http_tracing):
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         print("Cancelling tasks and exiting...")
-        await finish(devices, web_session, tcp_connector)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        await web_session.close()
-        await tcp_connector.close()
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await finish(devices, web_session, tcp_connector)
         print("Exited")
 
 
