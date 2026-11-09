@@ -184,6 +184,8 @@ class TVRuntime:
                         self._client.mute_ads,
                     )
                     retry = RETRY_INTERVAL
+                    if self._client.take_reconnect_back():
+                        await self._scheduler.dismiss_after_reconnect()
                     self._async_publish(connected=True)
                     self._async_lounge_updated()
                     await self._async_listen()

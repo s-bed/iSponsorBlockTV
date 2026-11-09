@@ -52,7 +52,7 @@ class PlaybackScheduler:
         if threshold is not None and state.duration is not None and 0 < state.duration < threshold:
             if self._disturbed_video == state.videoId:
                 return
-            work = self._disturb_short_video(state)
+            work = self._dismiss_video(state)
         elif state.currentTime is not None:
             work = self._schedule(state.videoId, state.currentTime, monotonic())
         else:
@@ -62,18 +62,25 @@ class PlaybackScheduler:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _disturb_short_video(self, state):
+    async def dismiss_after_reconnect(self):
+        """Dismiss the Shorts attempt on a newly restored connection."""
+        await self._dismiss_video(self._client.playback_state, after_reconnect=True)
+
+    async def _dismiss_video(self, state, *, after_reconnect=False):
         def before_send() -> bool:
             # Playback updates cancel pending work while it waits for the command lock.
-            if self._client.ad_playing or not self._client.connected():
+            if not self._client.connected() or (self._client.ad_playing and not after_reconnect):
                 return False
             self._pending = None
-            self._disturbed_video = state.videoId
-            self._logger.debug(
-                "Dismissing short video (duration %.3f s, threshold %.3f s) with Back",
-                state.duration,
-                self._short_video_duration_threshold,
-            )
+            self._disturbed_video = state.videoId if state else None
+            if after_reconnect:
+                self._logger.debug("Sending Back after reconnecting from a screen disconnect")
+            else:
+                self._logger.debug(
+                    "Dismissing short video (duration %.3f s, threshold %.3f s) with Back",
+                    state.duration,
+                    self._short_video_duration_threshold,
+                )
             return True
 
         try:

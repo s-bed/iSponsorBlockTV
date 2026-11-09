@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pyytlounge
 import pytest
 from aiohttp import ClientError
+from custom_components.isponsorblocktv.core import ytlounge
 from custom_components.isponsorblocktv.core.pairing import (
     PairedScreen,
     PairingRejected,
@@ -135,7 +136,9 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
     hass, enable_custom_integrations, caplog
 ):
     entry = _entry(hass)
-    tv = runtime.TVRuntime(hass, entry, None, {**DEFAULT_OPTIONS, "skip_ads": True})
+    tv = runtime.TVRuntime(
+        hass, entry, None, {**DEFAULT_OPTIONS, "skip_ads": True, "disturb_short_videos": False}
+    )
     client = tv._client
     client.auth.lounge_id_token = "private-lounge-token"
     caplog.set_level(logging.INFO)
@@ -191,6 +194,78 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
     caplog.clear()
     await client._process_event("onStateChange", [{"state": "1"}])
     assert "YouTube onStateChange" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("has_bind_playback", "expired"), [(False, False), (True, False), (False, True)]
+)
+async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
+    hass, has_bind_playback, expired
+):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": []})
+    client = tv._client
+    ordinary_reconnect = asyncio.Event()
+    connection_attempt = 0
+    back_attempts = []
+
+    async def connect():
+        nonlocal connection_attempt
+        connection_attempt += 1
+        if connection_attempt == 2:
+            return False
+        client._sid = client._gsession = "connected"
+        if connection_attempt == 3:
+            # YouTube can include the old subtitle track and playback in the bind response.
+            await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
+            if has_bind_playback:
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "short", "state": "1", "currentTime": "1", "duration": "18"}],
+                )
+        return True
+
+    async def subscribe():
+        if connection_attempt == 1:
+            await client._process_event(
+                "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
+            )
+        elif connection_attempt == 3:
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
+            await asyncio.gather(*client._actions)
+        else:
+            ordinary_reconnect.set()
+            await asyncio.Future()
+
+    async def send_command(_command, _parameters):
+        back_attempts.append(connection_attempt)
+        return True
+
+    with (
+        patch.object(runtime, "RETRY_INTERVAL", 0),
+        patch.object(ytlounge, "monotonic", side_effect=[100, 161 if expired else 110]),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect),
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
+        patch.object(pyytlounge.YtLoungeApi, "_command", side_effect=send_command) as command,
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(ordinary_reconnect.wait(), 5)
+        finally:
+            await tv.async_stop()
+
+    if expired:
+        command.assert_not_awaited()
+    else:
+        command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+        assert back_attempts == [3]
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):

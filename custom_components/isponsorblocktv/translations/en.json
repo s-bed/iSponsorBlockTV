@@ -79,7 +79,7 @@
         "data_description": {
           "skip_categories": "Clear all categories to disable SponsorBlock skipping on this TV.",
           "offset": "Use a positive value to send the seek command earlier.",
-          "disturb_short_videos": "Interrupt playback of videos shorter than the duration threshold, including regular YouTube videos.",
+          "disturb_short_videos": "Interrupt all videos shorter than the threshold, including regular videos. Also send Back after reconnecting from a recent TV-initiated user disconnect.",
           "short_video_duration_threshold": "Compare this threshold with the duration reported by the YouTube app."
         },
         "sections": {

@@ -6,6 +6,7 @@ import math
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ _WIRE_LOGGER = logging.getLogger(f"{__name__}.wire")
 _WIRE_LOGGER.addHandler(logging.NullHandler())
 _WIRE_LOGGER.propagate = False
 _REQUEST_TIMEOUT = 10
+_RECONNECT_BACK_WINDOW = 60
 
 
 @dataclass
@@ -73,7 +75,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._actions = set()
         self._state_callback = None
         self.playback_state = None
-        self.shorts_disconnected = False
+        self._shorts_disconnected_at: float | None = None
+        self._disturb_short_videos = getattr(config, "disturb_short_videos", False)
         self.auto_play = config.auto_play if config else True
         self.mute_ads = config.mute_ads if config else False
         self.skip_ads = config.skip_ads if config else False
@@ -286,13 +289,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                         return
         elif event_type == "onSubtitlesTrackChanged":
             video_id = data.get("videoId")
+            pending = self._shorts_disconnected_at is not None
             self.logger.debug(
                 "YouTube onSubtitlesTrackChanged: Shorts workaround pending=%s, has video=%s",
-                self.shorts_disconnected,
+                pending,
                 bool(video_id),
             )
-            if self.shorts_disconnected:
-                self.shorts_disconnected = False
+            if pending and not self._disturb_short_videos:
+                self._shorts_disconnected_at = None
                 if video_id:
                     self.logger.debug("Shorts workaround is requesting video playback")
                     self._start_action(self.play_video, video_id)
@@ -300,11 +304,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "loungeScreenDisconnected":
             reason = data.get("reason")
             if reason == "disconnectedByUserScreenInitiated":
-                self.shorts_disconnected = True
+                self._shorts_disconnected_at = monotonic()
             self.logger.debug(
                 "YouTube loungeScreenDisconnected: reason=%r, Shorts workaround pending=%s",
                 reason if isinstance(reason, str) else None,
-                self.shorts_disconnected,
+                self._shorts_disconnected_at is not None,
             )
         elif event_type == "onAutoplayModeChanged":
             self._start_action(self.set_auto_play_mode, self.auto_play)
@@ -353,6 +357,17 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
 
     async def get_now_playing(self):
         return await self._command("getNowPlaying")
+
+    def take_reconnect_back(self) -> bool:
+        """Consume a recent screen disconnect after a successful connection."""
+        if not self._disturb_short_videos or self._shorts_disconnected_at is None:
+            return False
+        disconnected_at = self._shorts_disconnected_at
+        self._shorts_disconnected_at = None
+        if monotonic() - disconnected_at > _RECONNECT_BACK_WINDOW:
+            self.logger.debug("Screen-initiated disconnect is too old for reconnect Back")
+            return False
+        return True
 
     async def press_back(self, *, only_if: Callable[[], bool]) -> bool:
         """Dismiss the player if the pending action is still valid."""

@@ -53,7 +53,12 @@ above the threshold and ads are excluded. Turn the option off for any TV where
 you want short videos to play.
 
 YouTube can show the Shorts connection warning before it reports a video's
-duration. The duration rule runs after playback starts. Home Assistant's
+duration. With **Disturb short videos** enabled, iSponsorBlockTV sends Back once
+if it reconnects within 60 seconds of YouTube reporting a screen-initiated user
+disconnect. This can also happen when you manually disconnect from the TV for
+another reason.
+
+Home Assistant's
 [Android TV Remote](https://www.home-assistant.io/integrations/androidtv_remote/#data-updates)
 uses the TV's local remote service and can navigate YouTube without creating a
 Lounge session. Its API lacks the playback duration needed for this rule.
