@@ -1,15 +1,25 @@
 """Exercise the Home Assistant connection and pairing state transitions."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
+import pyytlounge
+from aiohttp import ClientError
 from custom_components.isponsorblocktv.core.pairing import (
     PairedScreen,
     PairingRejected,
     PairingUnavailable,
 )
+from homeassistant.components.logger.helpers import (
+    DATA_LOGGER,
+    LoggerSetting,
+    LogPersistance,
+    LogSettingsType,
+)
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.helpers import issue_registry
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import runtime
@@ -22,6 +32,68 @@ def _entry(hass):
     entry = MockConfigEntry(domain=DOMAIN, data={"screen_id": SCREEN_ID}, title="Living room TV")
     entry.add_to_hass(hass)
     return entry
+
+
+async def test_integration_debug_logging_traces_ad_skip_and_shorts(
+    hass, enable_custom_integrations, caplog
+):
+    entry = _entry(hass)
+    tv = runtime.TVRuntime(hass, entry, None, {**DEFAULT_OPTIONS, "skip_ads": True})
+    client = tv._client
+    client.auth.lounge_id_token = "private-lounge-token"
+    caplog.set_level(logging.INFO)
+    caplog.handler.setLevel(logging.DEBUG)
+
+    await client._process_event("nowPlaying", [{"state": "1"}])
+    assert "YouTube nowPlaying" not in caplog.text
+
+    logger_class = logging.getLoggerClass()
+    try:
+        assert await async_setup_component(hass, "logger", {})
+    finally:
+        logging.setLoggerClass(logger_class)
+    settings = hass.data[DATA_LOGGER].settings
+    await settings.async_update(
+        hass, DOMAIN, LoggerSetting("DEBUG", LogPersistance.NONE, LogSettingsType.INTEGRATION)
+    )
+
+    with patch.object(
+        pyytlounge.YtLoungeApi,
+        "_command",
+        side_effect=[True, ClientError("https://example.com/?token=private-lounge-token")],
+    ) as command:
+        await client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
+        await asyncio.gather(*client._actions)
+        await client._process_event("onAdStateChange", [{"adState": "1082", "currentTime": "0"}])
+        await client._process_event("onStateChange", [{"state": "2", "currentTime": "8"}])
+        await client._process_event(
+            "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
+        )
+        await client._process_event("onSubtitlesTrackChanged", [{"videoId": "private-video-id"}])
+        await asyncio.gather(*client._actions)
+
+    assert [call.args[0] for call in command.await_args_list] == ["skipAd", "setPlaylist"]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == f"{runtime.__name__}.{entry.title}"
+    ]
+    log = "\n".join(messages)
+    assert "skipAd acknowledged=True" in log
+    assert "ad state code=1082" in log
+    assert "playback Playing -> Paused (state code=2, position=8.0 s" in log
+    assert "reason='disconnectedByUserScreenInitiated', Shorts workaround pending=True" in log
+    assert "setPlaylist ended (ClientError)" in log
+    assert "private-lounge-token" not in caplog.text
+    assert "private-video-id" not in caplog.text
+    assert SCREEN_ID not in caplog.text
+
+    await settings.async_update(
+        hass, DOMAIN, LoggerSetting("NOTSET", LogPersistance.NONE, LogSettingsType.INTEGRATION)
+    )
+    caplog.clear()
+    await client._process_event("onStateChange", [{"state": "1"}])
+    assert "YouTube onStateChange" not in caplog.text
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):

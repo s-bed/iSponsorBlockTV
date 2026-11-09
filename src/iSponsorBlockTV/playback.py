@@ -59,6 +59,12 @@ class PlaybackScheduler:
                 return
             self._seeking = True
             try:
+                self._logger.debug(
+                    "SponsorBlock seeking past segment %.3f to %.3f s (sampled position %.3f s)",
+                    start,
+                    end,
+                    position,
+                )
                 skipped = await self._client.seek_to(end)
                 if skipped:
                     self._last_skip = (video_id, end)

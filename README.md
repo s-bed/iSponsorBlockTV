@@ -45,6 +45,18 @@ SponsorBlock skip activity. The skip count and last-skip timestamp cover the
 current integration load. Additional video and audio sensors can be enabled
 from the device page.
 
+#### Playback troubleshooting
+
+In **Settings → Devices & services → iSponsorBlockTV**, open the integration menu
+and select **Enable debug logging**. Reproduce the playback or disconnect issue,
+then select **Disable debug logging** to download the Home Assistant log. Search
+for `custom_components.isponsorblocktv` and your TV's integration name.
+
+The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
+request, whether YouTube acknowledged the request, and whether a disconnect
+triggered the Shorts workaround. An acknowledgment confirms the request was
+accepted. The following playback events show what the TV did.
+
 #### Releases and previews
 
 Add the fork as a custom integration repository in HACS on Home Assistant
