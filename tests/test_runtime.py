@@ -10,7 +10,7 @@ from custom_components.isponsorblocktv.core.pairing import (
 )
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.helpers import issue_registry
-from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import runtime
 from custom_components.isponsorblocktv.const import DEFAULT_OPTIONS, DOMAIN

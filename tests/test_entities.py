@@ -14,7 +14,7 @@ from homeassistant.const import PERCENTAGE, STATE_OFF, STATE_UNAVAILABLE, UnitOf
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import binary_sensor, runtime, sensor
 from custom_components.isponsorblocktv.const import CONF_SCREEN_ID, DOMAIN

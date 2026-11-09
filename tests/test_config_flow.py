@@ -13,7 +13,7 @@ from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_SSDP, SOURCE_USER
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 from homeassistant.loader import async_get_ssdp
-from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import config_flow
 from custom_components.isponsorblocktv.const import (

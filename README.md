@@ -17,7 +17,7 @@ Check the [wiki](https://github.com/dmunozv04/iSponsorBlockTV/wiki/Installation)
 
 ### Home Assistant custom integration
 
-On Home Assistant 2026.11 or newer, use the custom integration to run
+On Home Assistant 2026.10 or newer, use the custom integration to run
 iSponsorBlockTV and configure each TV from the Home Assistant UI.
 
 1. From this repository, run `python3 tools/build_home_assistant.py`. Extract
@@ -47,10 +47,11 @@ from the device page.
 
 #### Releases and previews
 
-Add the fork as a custom integration repository in Home Assistant Marketplace
-(formerly HACS). Stable updates use the latest production release. Turn on the
-repository's **Pre-release** switch to get previews. That switch applies to the
-repository, so check the branch named in the release title before installing.
+Add the fork as a custom integration repository in HACS on Home Assistant
+2026.10 or Marketplace on 2026.11 and newer. Stable updates use the latest
+production release. Turn on the repository's **Pre-release** switch to get
+previews. That switch applies to the repository, so check the branch named in
+the release title before installing.
 
 - Pushes to custom branches publish a prerelease such as `2.12.0-beta.23`.
   Dependabot branches are excluded.
@@ -137,7 +138,7 @@ same integration ZIP that Home Assistant installs.
 
 ```sh
 python -m pip install -r tests/requirements.txt
-python -m pytest -p pytest_homeassistant --asyncio-mode=auto tests
+python -m pytest -p homeassistant --asyncio-mode=auto tests
 ```
 
 ## Contributors
