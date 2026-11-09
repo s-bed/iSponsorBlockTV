@@ -2,6 +2,7 @@
 
 import asyncio
 from hashlib import sha256
+from math import isfinite
 from typing import Any
 
 import probatio
@@ -370,15 +371,19 @@ def _sponsorblock_url(raw_url: str) -> str:
 
 
 class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
-    """Configure sponsor and ad handling independently for each TV."""
+    """Configure playback handling independently for each TV."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Edit this TV's settings."""
         options = DEFAULT_OPTIONS | self.config_entry.options
         errors = {}
         if user_input is not None:
+            previous_threshold = options["short_video_duration_threshold"]
             options.update({key: value for key, value in user_input.items() if key != _ADVANCED})
             options.update(user_input.get(_ADVANCED, {}))
+            if not isfinite(options["short_video_duration_threshold"]):
+                errors["short_video_duration_threshold"] = "invalid_short_video_duration_threshold"
+                options["short_video_duration_threshold"] = previous_threshold
             options["channel_whitelist"] = list(
                 dict.fromkeys(
                     channel.strip() for channel in options["channel_whitelist"] if channel.strip()
@@ -420,6 +425,17 @@ class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
                 ),
                 probatio.Required("mute_ads", default=options["mute_ads"]): BooleanSelector(),
                 probatio.Required("skip_ads", default=options["skip_ads"]): BooleanSelector(),
+                probatio.Required(
+                    "disturb_short_videos", default=options["disturb_short_videos"]
+                ): BooleanSelector(),
+                probatio.Required(
+                    "short_video_duration_threshold",
+                    default=options["short_video_duration_threshold"],
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=1, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="s"
+                    )
+                ),
                 probatio.Required("auto_play", default=options["auto_play"]): BooleanSelector(),
                 probatio.Required(
                     "skip_count_tracking", default=options["skip_count_tracking"]

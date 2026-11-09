@@ -13,6 +13,8 @@ DEFAULT_OPTIONS = {
     "offset": 0,
     "mute_ads": False,
     "skip_ads": False,
+    "disturb_short_videos": True,
+    "short_video_duration_threshold": 30,
     "auto_play": True,
     "skip_count_tracking": True,
     "join_name": "iSponsorBlockTV",

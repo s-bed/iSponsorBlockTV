@@ -1,4 +1,4 @@
-"""Schedule SponsorBlock seeks from YouTube Lounge playback updates."""
+"""Schedule playback actions from YouTube Lounge updates."""
 
 import asyncio
 from time import monotonic
@@ -7,18 +7,29 @@ from pyytlounge.models import State
 
 
 class PlaybackScheduler:
-    """Own work for one screen and acknowledge only successful seeks."""
+    """Schedule SponsorBlock seeks and short-video dismissal for one screen."""
 
-    def __init__(self, api_helper, client, offset_seconds, logger, *, on_skip=None):
+    def __init__(
+        self,
+        api_helper,
+        client,
+        offset_seconds,
+        logger,
+        *,
+        on_skip=None,
+        short_video_duration_threshold: float | None = None,
+    ):
         self._api_helper = api_helper
         self._client = client
         self._offset = offset_seconds
         self._logger = logger
         self._on_skip = on_skip
+        self._short_video_duration_threshold = short_video_duration_threshold
         self._pending = None
         self._tasks = set()
         self._seeking = False
         self._last_skip = None
+        self._disturbed_video = None
 
     async def __call__(self, state):
         if self._pending is not None:
@@ -30,13 +41,48 @@ class PlaybackScheduler:
                 state.currentTime is not None and state.currentTime >= last_end
             ):
                 self._last_skip = None
-        if state.state == State.Playing and state.videoId and state.currentTime is not None:
-            task = asyncio.create_task(
-                self._schedule(state.videoId, state.currentTime, monotonic())
+        if state.state in (State.Stopped, State.Buffering):
+            self._disturbed_video = None
+        if state.state != State.Playing or not state.videoId:
+            return
+        if state.videoId != self._disturbed_video:
+            self._disturbed_video = None
+
+        threshold = self._short_video_duration_threshold
+        if threshold is not None and state.duration is not None and 0 < state.duration < threshold:
+            if self._disturbed_video == state.videoId:
+                return
+            work = self._disturb_short_video(state)
+        elif state.currentTime is not None:
+            work = self._schedule(state.videoId, state.currentTime, monotonic())
+        else:
+            return
+        task = asyncio.create_task(work)
+        self._pending = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _disturb_short_video(self, state):
+        def before_send() -> bool:
+            # Playback updates cancel pending work while it waits for the command lock.
+            if self._client.ad_playing or not self._client.connected():
+                return False
+            self._pending = None
+            self._disturbed_video = state.videoId
+            self._logger.debug(
+                "Dismissing short video (duration %.3f s, threshold %.3f s) with Back",
+                state.duration,
+                self._short_video_duration_threshold,
             )
-            self._pending = task
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            return True
+
+        try:
+            await self._client.press_back(only_if=before_send)
+        except Exception as err:  # noqa: BLE001
+            self._logger.debug("Short video dismissal failed (%s)", type(err).__name__)
+        finally:
+            if self._pending is asyncio.current_task():
+                self._pending = None
 
     async def _schedule(self, video_id, position, sampled_at):
         try:
@@ -91,3 +137,4 @@ class PlaybackScheduler:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending = None
         self._last_skip = None
+        self._disturbed_video = None

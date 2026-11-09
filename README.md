@@ -45,6 +45,19 @@ SponsorBlock skip activity. The skip count and last-skip timestamp cover the
 current integration load. Additional video and audio sensors can be enabled
 from the device page.
 
+**Disturb short videos** is enabled by default for each TV. Once YouTube reports
+that a video is playing and gives its duration, iSponsorBlockTV sends a Back
+command to dismiss videos shorter than the configured threshold (30 seconds by
+default). This also applies to regular videos under the threshold. Videos at or
+above the threshold and ads are excluded. Turn the option off for any TV where
+you want short videos to play.
+
+YouTube can show the Shorts connection warning before it reports a video's
+duration. The duration rule runs after playback starts. Home Assistant's
+[Android TV Remote](https://www.home-assistant.io/integrations/androidtv_remote/#data-updates)
+uses the TV's local remote service and can navigate YouTube without creating a
+Lounge session. Its API lacks the playback duration needed for this rule.
+
 #### Playback troubleshooting
 
 In **Settings → Devices & services → iSponsorBlockTV**, open the integration menu

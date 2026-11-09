@@ -71,12 +71,16 @@
           "offset": "Skip timing offset",
           "mute_ads": "Mute YouTube ads",
           "skip_ads": "Skip YouTube ads when possible",
+          "disturb_short_videos": "Disturb short videos",
+          "short_video_duration_threshold": "Short video duration threshold",
           "auto_play": "Enable YouTube autoplay",
           "skip_count_tracking": "Report viewed segments to SponsorBlock"
         },
         "data_description": {
           "skip_categories": "Clear all categories to disable SponsorBlock skipping on this TV.",
-          "offset": "Use a positive value to send the seek command earlier."
+          "offset": "Use a positive value to send the seek command earlier.",
+          "disturb_short_videos": "Interrupt playback of videos shorter than the duration threshold, including regular YouTube videos.",
+          "short_video_duration_threshold": "Compare this threshold with the duration reported by the YouTube app."
         },
         "sections": {
           "advanced": {
@@ -97,6 +101,7 @@
     },
     "error": {
       "api_key_required": "Enter a YouTube Data API key to exclude channels.",
+      "invalid_short_video_duration_threshold": "Enter a finite duration in seconds.",
       "invalid_sponsorblock_url": "Enter a valid HTTP or HTTPS URL for the SponsorBlock API."
     }
   },

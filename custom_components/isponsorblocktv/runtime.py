@@ -95,7 +95,16 @@ class TVRuntime:
             on_update=self._async_lounge_updated,
         )
         self._scheduler = PlaybackScheduler(
-            api, self._client, options["offset"] / 1000, self._logger, on_skip=self._async_skipped
+            api,
+            self._client,
+            options["offset"] / 1000,
+            self._logger,
+            on_skip=self._async_skipped,
+            short_video_duration_threshold=(
+                options["short_video_duration_threshold"]
+                if options["disturb_short_videos"]
+                else None
+            ),
         )
 
     @callback

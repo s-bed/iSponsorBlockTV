@@ -4,13 +4,14 @@ import json
 import logging
 import math
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 import pyytlounge
 from aiohttp import ClientSession
-from pyytlounge.models import State
+from pyytlounge.models import DpadCommand, State
 from pyytlounge.wrapper import NotLinkedException, api_base, as_aiter
 
 from .constants import youtube_client_blacklist
@@ -126,7 +127,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         if not isinstance(video_id, str) or state in (State.Stopped, State.Buffering):
             video_id = ""
         duration = _nonnegative_float(data.get("duration"))
-        if duration is None and video_id and video_id == previous.videoId:
+        # Lounge can report an ad's duration with the content's video ID.
+        ad_states = (State.Advertisement, State.AdSkipped)
+        if (
+            duration is None
+            and video_id
+            and video_id == previous.videoId
+            and (state in ad_states) == (previous.state in ad_states)
+        ):
             duration = previous.duration
         self.playback_state = PlaybackState(
             currentTime=_nonnegative_float(data.get("currentTime")),
@@ -346,11 +354,23 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     async def get_now_playing(self):
         return await self._command("getNowPlaying")
 
+    async def press_back(self, *, only_if: Callable[[], bool]) -> bool:
+        """Dismiss the player if the pending action is still valid."""
+        return await self._command("dpadCommand", {"key": DpadCommand.BACK.value}, only_if=only_if)
+
     # Test to wrap the command function in a mutex to avoid race conditions with
     # the _command_offset (TODO: move to upstream if it works)
-    async def _command(self, command: str, command_parameters: dict | None = None) -> bool:
+    async def _command(
+        self,
+        command: str,
+        command_parameters: dict | None = None,
+        *,
+        only_if: Callable[[], bool] | None = None,
+    ) -> bool:
         try:
             async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
+                if only_if is not None and not only_if():
+                    return False
                 self.logger.debug("Sending YouTube Lounge command %s", command)
                 acknowledged = await super()._command(command, command_parameters)
         except (Exception, asyncio.CancelledError) as err:

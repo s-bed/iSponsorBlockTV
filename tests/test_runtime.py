@@ -5,6 +5,7 @@ import logging
 from unittest.mock import AsyncMock, patch
 
 import pyytlounge
+import pytest
 from aiohttp import ClientError
 from custom_components.isponsorblocktv.core.pairing import (
     PairedScreen,
@@ -32,6 +33,102 @@ def _entry(hass):
     entry = MockConfigEntry(domain=DOMAIN, data={"screen_id": SCREEN_ID}, title="Living room TV")
     entry.add_to_hass(hass)
     return entry
+
+
+def _playback_runtime(hass, **options):
+    tv = runtime.TVRuntime(
+        hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": [], **options}
+    )
+    tv._client._state_callback = tv._scheduler
+    tv._client._sid = tv._client._gsession = "connected"
+    return tv
+
+
+@pytest.mark.parametrize(
+    ("options", "duration", "dismiss"),
+    [
+        ({}, "29.9", True),
+        ({}, "30", False),
+        ({"short_video_duration_threshold": 45}, "30", True),
+        ({"disturb_short_videos": False}, "20", False),
+        ({}, None, False),
+        ({}, "0", False),
+    ],
+)
+async def test_short_video_dismissal_uses_this_tvs_options(hass, options, duration, dismiss):
+    tv = _playback_runtime(hass, **options)
+    client = tv._client
+    sample = {"videoId": "video", "state": "1", "currentTime": "0"}
+    if duration is not None:
+        sample["duration"] = duration
+
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            await client._process_event("nowPlaying", [sample])
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            if dismiss:
+                command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+                await client._process_event(
+                    "nowPlaying", [{**sample, "videoId": "next", "state": "3"}]
+                )
+                await asyncio.gather(*tv._scheduler._tasks)
+                assert command.await_count == 1
+                await client._process_event("onStateChange", [{"state": "1", "currentTime": "0"}])
+                await asyncio.gather(*tv._scheduler._tasks)
+                assert command.await_count == 2
+            else:
+                command.assert_not_awaited()
+        finally:
+            await tv._scheduler.cancel()
+
+    assert tv.snapshot.skip_count == 0
+
+
+async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "video", "state": "1081", "currentTime": "0", "duration": "18"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            assert client.playback_state.duration is None
+        finally:
+            await tv._scheduler.cancel()
+
+    command.assert_not_awaited()
+
+
+async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_video(hass):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            async with client._command_mutex:
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "short", "state": "1", "currentTime": "0", "duration": "18"}],
+                )
+                await asyncio.sleep(0)
+                queued = tv._scheduler._pending
+                assert queued is not None
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "long", "state": "1", "currentTime": "0", "duration": "65"}],
+                )
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            await asyncio.gather(*tv._scheduler._tasks)
+        finally:
+            await tv._scheduler.cancel()
+
+    command.assert_not_awaited()
 
 
 async def test_integration_debug_logging_traces_ad_skip_and_shorts(
