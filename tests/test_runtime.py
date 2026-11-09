@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pyytlounge
@@ -67,10 +68,14 @@ async def test_short_video_dismissal_uses_this_tvs_options(hass, options, durati
         try:
             await client._process_event("nowPlaying", [sample])
             await asyncio.gather(*tv._scheduler._tasks)
+            first_disruption = tv.snapshot.last_short_disruption
             await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
             await asyncio.gather(*tv._scheduler._tasks)
+            assert tv.snapshot.last_short_disruption == first_disruption
             if dismiss:
                 command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+                assert first_disruption is not None
+                assert first_disruption.tzinfo is UTC
                 await client._process_event(
                     "nowPlaying", [{**sample, "videoId": "next", "state": "3"}]
                 )
@@ -81,6 +86,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(hass, options, durati
                 assert command.await_count == 2
             else:
                 command.assert_not_awaited()
+                assert first_disruption is None
         finally:
             await tv._scheduler.cancel()
 
@@ -104,6 +110,7 @@ async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
             await tv._scheduler.cancel()
 
     command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
 
 
 async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_video(hass):
@@ -130,6 +137,7 @@ async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_vide
             await tv._scheduler.cancel()
 
     command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
 
 
 async def test_integration_debug_logging_traces_ad_skip_and_shorts(
@@ -197,10 +205,11 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
 
 
 @pytest.mark.parametrize(
-    ("has_bind_playback", "expired"), [(False, False), (True, False), (False, True)]
+    ("has_bind_playback", "expired", "acknowledged"),
+    [(False, False, True), (True, False, True), (False, True, True), (False, False, False)],
 )
 async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
-    hass, has_bind_playback, expired
+    hass, has_bind_playback, expired, acknowledged
 ):
     tv = runtime.TVRuntime(hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": []})
     client = tv._client
@@ -233,13 +242,14 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
             await asyncio.gather(*tv._scheduler._tasks)
             await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
             await asyncio.gather(*client._actions)
+            client._connection_lost()
         else:
             ordinary_reconnect.set()
             await asyncio.Future()
 
     async def send_command(_command, _parameters):
         back_attempts.append(connection_attempt)
-        return True
+        return acknowledged
 
     with (
         patch.object(runtime, "RETRY_INTERVAL", 0),
@@ -266,6 +276,7 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
     else:
         command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
         assert back_attempts == [3]
+    assert (tv.snapshot.last_short_disruption is not None) == (not expired and acknowledged)
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):
@@ -322,6 +333,106 @@ async def test_temporary_failure_and_offline_tv_do_not_start_repair(hass):
     assert not list(entry.async_get_active_flows(hass, {SOURCE_REAUTH}))
 
 
+@pytest.mark.parametrize(
+    ("stream_ends", "invalid_session"),
+    [(1, False), (1, True), (3, False)],
+    ids=["stream-ended", "session-invalid", "retries-exhausted"],
+)
+async def test_event_stream_recovery_reuses_session_before_rebinding(
+    hass, stream_ends, invalid_session
+):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    expected_binds = 2 if invalid_session or stream_ends > 1 else 1
+    listening = asyncio.Event()
+    playback_work_started = asyncio.Event()
+    playback_work_cancelled = asyncio.Event()
+    refreshed = asyncio.Event()
+    binds = 0
+    subscriptions = []
+
+    async def connect():
+        nonlocal binds
+        binds += 1
+        client._sid = f"session-{binds}"
+        client._gsession = f"gsession-{binds}"
+        client._last_event_id = 0
+        return True
+
+    async def subscribe():
+        params = client._common_connection_parameters()
+        subscriptions.append((params["SID"], params["gsessionid"], params["AID"]))
+        if len(subscriptions) == 1:
+            await client._process_events(
+                [[42, ["nowPlaying", {"videoId": "video", "state": "1", "currentTime": "2"}]]]
+            )
+            await playback_work_started.wait()
+            if invalid_session:
+                assert not client._handle_session_result(400, "Unknown SID")
+        if len(subscriptions) <= stream_ends:
+            return
+        if expected_binds == 1:
+            # An update without a video ID must not reuse playback from the old stream.
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "20"}])
+            await asyncio.sleep(0)
+        listening.set()
+        await asyncio.Future()
+
+    async def get_segments(_video_id):
+        playback_work_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            playback_work_cancelled.set()
+
+    async def refresh_playback():
+        refreshed.set()
+        return True
+
+    with (
+        patch.object(runtime, "RETRY_INTERVAL", 0),
+        patch.object(runtime, "STREAM_RETRY_DELAY", 0),
+        patch.object(runtime, "STREAM_RETRY_LIMIT", 2),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ) as verify,
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect),
+        patch.object(client, "get_now_playing", side_effect=refresh_playback),
+        patch.object(
+            client.api_helper, "get_segments", new_callable=AsyncMock, side_effect=get_segments
+        ) as segments,
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True) as terminate,
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(listening.wait(), 5)
+            assert subscriptions[0] == ("session-1", "gsession-1", 0)
+            if invalid_session:
+                assert subscriptions[1:] == [("session-2", "gsession-2", 0)]
+            elif stream_ends == 1:
+                assert subscriptions[1:] == [("session-1", "gsession-1", 42)]
+                await asyncio.wait_for(refreshed.wait(), 5)
+            else:
+                assert subscriptions[1:] == [
+                    ("session-1", "gsession-1", 42),
+                    ("session-1", "gsession-1", 42),
+                    ("session-2", "gsession-2", 0),
+                ]
+            assert binds == verify.await_count == expected_binds
+            assert tv.snapshot.connected
+            assert playback_work_cancelled.is_set()
+            segments.assert_awaited_once_with("video")
+            terminate.assert_not_awaited()
+        finally:
+            await tv.async_stop()
+
+    terminate.assert_awaited_once()
+
+
 async def test_expired_session_and_disconnect_reverify_and_unload_cancels_subscription(hass):
     entry = _entry(hass)
     tv = runtime.TVRuntime(hass, entry, None, DEFAULT_OPTIONS)
@@ -329,8 +440,9 @@ async def test_expired_session_and_disconnect_reverify_and_unload_cancels_subscr
     subscription_cancelled = asyncio.Event()
     subscription_calls = 0
 
-    async def subscribe(_scheduler):
+    async def subscribe(_scheduler, *, resume=False):
         nonlocal subscription_calls
+        assert not resume
         subscription_calls += 1
         if subscription_calls == 1:
             return

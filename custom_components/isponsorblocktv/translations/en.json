@@ -125,6 +125,7 @@
       },
       "skip_count": {"name": "Lifetime SponsorBlock skips"},
       "last_skip": {"name": "Last SponsorBlock skip"},
+      "last_short_disruption": {"name": "Last YouTube Shorts disruption"},
       "video_id": {"name": "Video ID"},
       "duration": {"name": "Video duration"},
       "playback_speed": {"name": "Playback speed"},

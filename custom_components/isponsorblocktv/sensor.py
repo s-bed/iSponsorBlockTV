@@ -1,4 +1,4 @@
-"""Playback and SponsorBlock activity sensors."""
+"""Playback and activity sensors."""
 
 from datetime import datetime
 
@@ -25,6 +25,11 @@ SENSORS = (
     SensorEntityDescription(
         key="last_skip",
         translation_key="last_skip",
+        device_class=SensorDeviceClass.TIMESTAMP,
+    ),
+    SensorEntityDescription(
+        key="last_short_disruption",
+        translation_key="last_short_disruption",
         device_class=SensorDeviceClass.TIMESTAMP,
     ),
     SensorEntityDescription(
@@ -66,11 +71,12 @@ class ISponsorBlockTVSensor(ISponsorBlockTVEntity, SensorEntity):
     def __init__(
         self, entry: ISponsorBlockTVConfigEntry, description: SensorEntityDescription
     ) -> None:
-        super().__init__(
-            entry,
-            description,
-            requires_connection=description.key not in {"skip_count", "last_skip"},
-        )
+        requires_connection = description.key not in {
+            "skip_count",
+            "last_skip",
+            "last_short_disruption",
+        }
+        super().__init__(entry, description, requires_connection=requires_connection)
 
     @property
     def native_value(self) -> str | int | float | datetime | None:

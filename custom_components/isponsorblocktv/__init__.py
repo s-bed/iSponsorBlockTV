@@ -8,7 +8,7 @@ from homeassistant.helpers.aiohttp_client import (
 )
 
 from .const import DEFAULT_OPTIONS
-from .runtime import ISponsorBlockTVConfigEntry, TVRuntime, skip_stats_store
+from .runtime import ISponsorBlockTVConfigEntry, TVRuntime, activity_store
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
@@ -22,7 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ISponsorBlockTVConfigEnt
         else async_get_clientsession(hass)
     )
     runtime = entry.runtime_data = TVRuntime(hass, entry, session, options)
-    await runtime.async_restore_skip_stats()
+    await runtime.async_restore_activity()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     runtime.async_start()
     return True
@@ -37,5 +37,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ISponsorBlockTVConfigEn
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ISponsorBlockTVConfigEntry) -> None:
-    """Remove saved skip totals when the TV entry is deleted."""
-    await skip_stats_store(hass, entry.entry_id).async_remove()
+    """Remove saved playback activity when the TV entry is deleted."""
+    await activity_store(hass, entry.entry_id).async_remove()

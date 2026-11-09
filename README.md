@@ -60,6 +60,10 @@ if it reconnects within 60 seconds of YouTube reporting a screen-initiated user
 disconnect. This can also happen when you manually disconnect from the TV for
 another reason.
 
+**Last YouTube Shorts disruption** records when YouTube last acknowledged a
+Back command from either of these rules. The timestamp is saved per TV across
+Home Assistant restarts and remains available while the YouTube app is offline.
+
 Home Assistant's
 [Android TV Remote](https://www.home-assistant.io/integrations/androidtv_remote/#data-updates)
 uses the TV's local remote service and can navigate YouTube without creating a
