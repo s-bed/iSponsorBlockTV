@@ -17,6 +17,7 @@ class PlaybackScheduler:
         logger,
         *,
         on_skip=None,
+        on_short_disruption=None,
         short_video_duration_threshold: float | None = None,
     ):
         self._api_helper = api_helper
@@ -24,6 +25,7 @@ class PlaybackScheduler:
         self._offset = offset_seconds
         self._logger = logger
         self._on_skip = on_skip
+        self._on_short_disruption = on_short_disruption
         self._short_video_duration_threshold = short_video_duration_threshold
         self._pending = None
         self._tasks = set()
@@ -84,7 +86,9 @@ class PlaybackScheduler:
             return True
 
         try:
-            await self._client.press_back(only_if=before_send)
+            dismissed = await self._client.press_back(only_if=before_send)
+            if dismissed and self._on_short_disruption is not None:
+                self._on_short_disruption()
         except Exception as err:  # noqa: BLE001
             self._logger.debug("Short video dismissal failed (%s)", type(err).__name__)
         finally:

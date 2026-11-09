@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import UTC
 from unittest.mock import AsyncMock, patch
 
 import pyytlounge
@@ -67,10 +68,14 @@ async def test_short_video_dismissal_uses_this_tvs_options(hass, options, durati
         try:
             await client._process_event("nowPlaying", [sample])
             await asyncio.gather(*tv._scheduler._tasks)
+            first_disruption = tv.snapshot.last_short_disruption
             await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
             await asyncio.gather(*tv._scheduler._tasks)
+            assert tv.snapshot.last_short_disruption == first_disruption
             if dismiss:
                 command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+                assert first_disruption is not None
+                assert first_disruption.tzinfo is UTC
                 await client._process_event(
                     "nowPlaying", [{**sample, "videoId": "next", "state": "3"}]
                 )
@@ -81,6 +86,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(hass, options, durati
                 assert command.await_count == 2
             else:
                 command.assert_not_awaited()
+                assert first_disruption is None
         finally:
             await tv._scheduler.cancel()
 
@@ -104,6 +110,7 @@ async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
             await tv._scheduler.cancel()
 
     command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
 
 
 async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_video(hass):
@@ -130,6 +137,7 @@ async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_vide
             await tv._scheduler.cancel()
 
     command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
 
 
 async def test_integration_debug_logging_traces_ad_skip_and_shorts(
@@ -197,10 +205,11 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
 
 
 @pytest.mark.parametrize(
-    ("has_bind_playback", "expired"), [(False, False), (True, False), (False, True)]
+    ("has_bind_playback", "expired", "acknowledged"),
+    [(False, False, True), (True, False, True), (False, True, True), (False, False, False)],
 )
 async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
-    hass, has_bind_playback, expired
+    hass, has_bind_playback, expired, acknowledged
 ):
     tv = runtime.TVRuntime(hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": []})
     client = tv._client
@@ -239,7 +248,7 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
 
     async def send_command(_command, _parameters):
         back_attempts.append(connection_attempt)
-        return True
+        return acknowledged
 
     with (
         patch.object(runtime, "RETRY_INTERVAL", 0),
@@ -266,6 +275,7 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
     else:
         command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
         assert back_attempts == [3]
+    assert (tv.snapshot.last_short_disruption is not None) == (not expired and acknowledged)
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):

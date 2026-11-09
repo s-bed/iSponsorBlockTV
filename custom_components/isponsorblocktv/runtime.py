@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from aiohttp import ClientSession
 from homeassistant.config_entries import ConfigEntry
@@ -27,7 +27,7 @@ AUTH_CHECK_INTERVAL = 15 * 60
 RETRY_INTERVAL = 10
 MAX_RETRY_INTERVAL = 60
 DISCONNECT_TIMEOUT = 3
-SKIP_STATS_SAVE_DELAY = 5
+ACTIVITY_SAVE_DELAY = 5
 PLAYBACK_STATES = {
     State.Stopped: "idle",
     State.Buffering: "idle",  # YouTube sends this value when playback ends.
@@ -39,15 +39,17 @@ PLAYBACK_STATES = {
 }
 
 
-class SkipStats(TypedDict):
-    """The two values retained between Home Assistant sessions."""
+class PlaybackActivity(TypedDict):
+    """Playback activity retained between Home Assistant sessions."""
 
     count: int
     last_skip: str | None
+    last_short_disruption: NotRequired[str | None]
 
 
-def skip_stats_store(hass: HomeAssistant, entry_id: str) -> Store[SkipStats]:
-    """Open storage for one TV's skip totals."""
+def activity_store(hass: HomeAssistant, entry_id: str) -> Store[PlaybackActivity]:
+    """Open storage for one TV's playback activity."""
+    # Retain the existing key so saved SponsorBlock statistics carry forward.
     return Store(hass, 1, f"{DOMAIN}.{entry_id}.skips", atomic_writes=True)
 
 
@@ -62,6 +64,7 @@ class TVSnapshot:
     ad_skippable: bool | None = None
     skip_count: int = 0
     last_skip: datetime | None = None
+    last_short_disruption: datetime | None = None
     video_id: str | None = None
     duration: float | None = None
     playback_speed: float | None = None
@@ -87,8 +90,8 @@ class TVRuntime:
         self._listeners: set[Callable[[], None]] = set()
         self._task: asyncio.Task[None] | None = None
         self._rejections = 0
-        self._skip_store = skip_stats_store(hass, entry.entry_id)
-        self._skip_stats_changed = False
+        self._activity_store = activity_store(hass, entry.entry_id)
+        self._activity_changed = False
         self.snapshot = TVSnapshot()
 
         config = SimpleNamespace(
@@ -116,6 +119,7 @@ class TVRuntime:
             options["offset"] / 1000,
             self._logger,
             on_skip=self._async_skipped,
+            on_short_disruption=self._async_short_disrupted,
             short_video_duration_threshold=(
                 options["short_video_duration_threshold"]
                 if options["disturb_short_videos"]
@@ -123,14 +127,18 @@ class TVRuntime:
             ),
         )
 
-    async def async_restore_skip_stats(self) -> None:
-        """Load the saved total before exposing the sensors."""
-        if (stats := await self._skip_store.async_load()) is not None:
-            last_skip = stats["last_skip"]
+    async def async_restore_activity(self) -> None:
+        """Load saved playback activity before exposing the sensors."""
+        if (activity := await self._activity_store.async_load()) is not None:
+            last_skip = activity["last_skip"]
+            last_short_disruption = activity.get("last_short_disruption")
             self.snapshot = replace(
                 self.snapshot,
-                skip_count=stats["count"],
+                skip_count=activity["count"],
                 last_skip=datetime.fromisoformat(last_skip) if last_skip else None,
+                last_short_disruption=(
+                    datetime.fromisoformat(last_short_disruption) if last_short_disruption else None
+                ),
             )
 
     @callback
@@ -141,14 +149,14 @@ class TVRuntime:
         )
 
     async def async_stop(self) -> None:
-        """Stop playback work and flush the total before the entry reloads."""
+        """Stop playback work and save activity before the entry reloads."""
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
-        if self._skip_stats_changed:
-            await self._skip_store.async_save(self._skip_stats_data())
-            self._skip_stats_changed = False
+        if self._activity_changed:
+            await self._activity_store.async_save(self._activity_data())
+            self._activity_changed = False
 
     @callback
     def async_subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -185,15 +193,28 @@ class TVRuntime:
     @callback
     def _async_skipped(self) -> None:
         self._async_publish(skip_count=self.snapshot.skip_count + 1, last_skip=datetime.now(UTC))
-        self._skip_stats_changed = True
-        self._skip_store.async_delay_save(self._skip_stats_data, SKIP_STATS_SAVE_DELAY)
+        self._async_save_activity()
 
     @callback
-    def _skip_stats_data(self) -> SkipStats:
+    def _async_short_disrupted(self) -> None:
+        self._async_publish(last_short_disruption=datetime.now(UTC))
+        self._async_save_activity()
+
+    @callback
+    def _async_save_activity(self) -> None:
+        self._activity_changed = True
+        self._activity_store.async_delay_save(self._activity_data, ACTIVITY_SAVE_DELAY)
+
+    @callback
+    def _activity_data(self) -> PlaybackActivity:
         last_skip = self.snapshot.last_skip
+        last_short_disruption = self.snapshot.last_short_disruption
         return {
             "count": self.snapshot.skip_count,
             "last_skip": last_skip.isoformat() if last_skip else None,
+            "last_short_disruption": (
+                last_short_disruption.isoformat() if last_short_disruption else None
+            ),
         }
 
     async def _async_verify(self) -> str:
