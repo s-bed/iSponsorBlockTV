@@ -66,10 +66,10 @@ repository, so check the branch named in the release title before installing.
 
 Use the production workflow for stable Home Assistant releases on this fork.
 Marketplace selects stable releases from the repository's shared GitHub
-release list. If a preview branch changes workflow files relative to the
-default branch, GitHub requires extra permission to publish it. For trusted
-branches, set the optional `HA_RELEASE_TOKEN` Actions secret to a
-repository-scoped token with **Contents** and **Workflows** write access.
+release list. The workflows use GitHub's built-in token by default. If GitHub
+denies publishing a preview that changes workflow files, set the optional
+`HA_RELEASE_TOKEN` Actions secret for trusted branches to a repository-scoped
+token with **Contents** and **Workflows** write access.
 
 ## Compatibility
 
