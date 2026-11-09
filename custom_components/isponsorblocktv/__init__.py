@@ -7,6 +7,7 @@ from homeassistant.helpers.aiohttp_client import (
     async_get_clientsession,
 )
 
+from .channel_settings import async_get_channel_settings
 from .const import DEFAULT_OPTIONS
 from .runtime import ISponsorBlockTVConfigEntry, TVRuntime, activity_store
 
@@ -15,13 +16,30 @@ PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ISponsorBlockTVConfigEntry) -> bool:
     """Set up entities and start listening without blocking on a TV."""
+    settings = await async_get_channel_settings(hass)
     options = {**DEFAULT_OPTIONS, **entry.options}
+    blocklist = (
+        options["channel_blocklist"]
+        if options["override_channel_blocklist"]
+        else settings.blocklist
+    )
+    channel_api_key = options.get("apikey", "") if settings.key_conflict else settings.api_key
+    blocked_channels = (
+        frozenset(blocklist) if settings.api_key and not settings.key_conflict else frozenset()
+    )
     session = (
         async_create_clientsession(hass, trust_env=True)
         if options["use_proxy"]
         else async_get_clientsession(hass)
     )
-    runtime = entry.runtime_data = TVRuntime(hass, entry, session, options)
+    runtime = entry.runtime_data = TVRuntime(
+        hass,
+        entry,
+        session,
+        options,
+        blocked_channels=blocked_channels,
+        channel_api_key=channel_api_key,
+    )
     await runtime.async_restore_activity()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     runtime.async_start()

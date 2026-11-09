@@ -74,13 +74,15 @@
           "disturb_short_videos": "Disturb short videos",
           "short_video_duration_threshold": "Short video duration threshold",
           "auto_play": "Enable YouTube autoplay",
-          "skip_count_tracking": "Report viewed segments to SponsorBlock"
+          "skip_count_tracking": "Report viewed segments to SponsorBlock",
+          "channel_settings": "Open channel settings"
         },
         "data_description": {
           "skip_categories": "Clear all categories to disable SponsorBlock skipping on this TV.",
           "offset": "Use a positive value to send the seek command earlier.",
           "disturb_short_videos": "Interrupt all videos shorter than the threshold, including regular videos. Also send Back after reconnecting from a recent TV-initiated user disconnect.",
-          "short_video_duration_threshold": "Compare this threshold with the duration reported by the YouTube app."
+          "short_video_duration_threshold": "Compare this threshold with the duration reported by the YouTube app.",
+          "channel_settings": "Choose a channel settings menu and submit. Save playback changes separately."
         },
         "sections": {
           "advanced": {
@@ -88,21 +90,101 @@
             "data": {
               "join_name": "Name shown in the YouTube app",
               "sponsorblock_api_url": "SponsorBlock API URL",
-              "apikey": "YouTube Data API key",
               "channel_whitelist": "Channels to exclude from SponsorBlock skipping",
               "use_proxy": "Use the environment proxy"
             },
             "data_description": {
-              "channel_whitelist": "Enter the YouTube channel ID for each channel you want to exclude. Requires a YouTube Data API key."
+              "channel_whitelist": "Enter the YouTube channel ID for each channel you want to exclude. Set the YouTube Data API key in Global channel settings."
             }
           }
         }
+      },
+      "tv_channels": {
+        "title": "Channel settings for this TV",
+        "menu_options": {
+          "tv_blocklist_mode": "Choose which blocklist this TV uses",
+          "tv_blocklist": "Edit this TV's blocklist"
+        }
+      },
+      "global_channels": {
+        "title": "Global channel settings",
+        "description": "The API key is shared by all TVs. Each TV uses the global blocklist by default.",
+        "menu_options": {
+          "global_api_key": "Set or clear the shared YouTube Data API key",
+          "global_blocklist": "Edit the global blocklist"
+        }
+      },
+      "tv_blocklist_mode": {
+        "title": "Choose this TV's blocklist",
+        "description": "Turn this on to use this TV's own blocklist in place of the global list. An empty override allows all channels. Turning it off returns to the global list.",
+        "data": {"override_channel_blocklist": "Override global blocklist"}
+      },
+      "global_api_key": {
+        "title": "Shared YouTube Data API key",
+        "description": "Shared key {key_status}\n\nEnter a key to replace it. Clearing it disables channel searches and playback checks for all TVs.",
+        "data": {"api_key": "New YouTube Data API key", "clear_api_key": "Clear the shared key"}
+      },
+      "tv_blocklist": {
+        "title": "Blocklist for this TV",
+        "description": "Saved channels {count}. This list takes effect when the TV is set to use its own blocklist. A shared API key is required to check channels during playback.",
+        "menu_options": {
+          "channel_search": "Search for a channel by name",
+          "channel_add_id": "Add a channel by ID",
+          "channel_remove": "Remove saved channels"
+        }
+      },
+      "global_blocklist": {
+        "title": "Global channel blocklist",
+        "description": "Saved channels {count}. This list applies to TVs that use the global blocklist. A shared API key is required to check channels during playback.",
+        "menu_options": {
+          "channel_search": "Search for a channel by name",
+          "channel_add_id": "Add a channel by ID",
+          "channel_remove": "Remove saved channels"
+        }
+      },
+      "channel_search": {
+        "title": "Find a YouTube channel",
+        "data": {"query": "Channel name"}
+      },
+      "channel_select": {
+        "title": "Choose the channel to block",
+        "description": "Check the name and description before saving the channel ID.",
+        "data": {"channel_id": "Matching channels"}
+      },
+      "channel_add_id": {
+        "title": "Add a YouTube channel ID",
+        "description": "Enter the 24-character ID starting with UC. You can find it after `/channel/` in the channel's ID-based URL.",
+        "data": {"channel_id": "Channel ID"}
+      },
+      "channel_remove": {
+        "title": "Remove channels from the blocklist",
+        "data": {"channel_ids": "Saved channels"}
       }
     },
     "error": {
-      "api_key_required": "Enter a YouTube Data API key to exclude channels.",
+      "api_key_required": "Set the shared YouTube Data API key before changing which channels are excluded from SponsorBlock.",
+      "api_key_rejected": "YouTube rejected the request. Check the shared key, whether the YouTube Data API is enabled, and its quota.",
+      "api_key_required_for_channel_search": "Set the shared YouTube Data API key in Global channel settings to search by name.",
+      "channel_already_blocked": "This channel is already saved in this blocklist.",
+      "channel_lookup_failed": "YouTube channel data is unavailable. Try again.",
+      "channel_not_found": "No channels matched that name.",
+      "channel_query_required": "Enter a channel name.",
+      "channel_search_failed": "YouTube channel search is unavailable. Check the shared key and search quota, then try again.",
+      "channel_settings_save_failed": "Home Assistant could not save the global channel settings. Try again.",
+      "invalid_channel_id": "Enter a valid YouTube channel ID starting with UC.",
       "invalid_short_video_duration_threshold": "Enter a finite duration in seconds.",
-      "invalid_sponsorblock_url": "Enter a valid HTTP or HTTPS URL for the SponsorBlock API."
+      "invalid_sponsorblock_url": "Enter a valid HTTP or HTTPS URL for the SponsorBlock API.",
+      "legacy_api_key_conflict": "Existing TVs use different API keys. Enter the key all TVs should share.",
+      "provide_key_or_clear": "Enter a new key or choose to clear it.",
+      "select_channel_to_remove": "Select at least one channel to remove."
+    }
+  },
+  "selector": {
+    "channel_settings": {
+      "options": {
+        "tv": "Channel settings for this TV",
+        "global": "Global channel settings (all TVs)"
+      }
     }
   },
   "entity": {

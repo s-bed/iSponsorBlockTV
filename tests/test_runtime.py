@@ -3,10 +3,11 @@
 import asyncio
 import logging
 from datetime import UTC
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
-import pyytlounge
 import pytest
+import pyytlounge
 from aiohttp import ClientError
 from custom_components.isponsorblocktv.core import ytlounge
 from custom_components.isponsorblocktv.core.pairing import (
@@ -26,20 +27,33 @@ from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import runtime
+from custom_components.isponsorblocktv.channel_settings import (
+    async_set_api_key,
+    async_update_global_blocklist,
+)
 from custom_components.isponsorblocktv.const import DEFAULT_OPTIONS, DOMAIN
 
 SCREEN_ID = "a" * 64
+BLOCKED_CHANNEL = "UC" + "a" * 22
+LOCAL_CHANNEL = "UC" + "b" * 22
 
 
-def _entry(hass):
-    entry = MockConfigEntry(domain=DOMAIN, data={"screen_id": SCREEN_ID}, title="Living room TV")
+def _entry(hass, **options):
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={"screen_id": SCREEN_ID}, title="Living room TV", options=options
+    )
     entry.add_to_hass(hass)
     return entry
 
 
-def _playback_runtime(hass, **options):
+def _playback_runtime(hass, *, blocked_channels=frozenset(), **options):
     tv = runtime.TVRuntime(
-        hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": [], **options}
+        hass,
+        _entry(hass),
+        None,
+        {**DEFAULT_OPTIONS, "skip_categories": [], **options},
+        blocked_channels=blocked_channels,
+        channel_api_key="example-key" if blocked_channels else "",
     )
     tv._client._state_callback = tv._scheduler
     tv._client._sid = tv._client._gsession = "connected"
@@ -138,6 +152,130 @@ async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_vide
 
     command.assert_not_awaited()
     assert tv.snapshot.last_short_disruption is None
+
+
+@pytest.mark.parametrize(
+    ("options", "effective"),
+    [
+        ({}, {BLOCKED_CHANNEL}),
+        ({"channel_blocklist": [LOCAL_CHANNEL]}, {BLOCKED_CHANNEL}),
+        (
+            {"override_channel_blocklist": True, "channel_blocklist": [LOCAL_CHANNEL]},
+            {LOCAL_CHANNEL},
+        ),
+        ({"override_channel_blocklist": True}, set()),
+    ],
+)
+async def test_entry_setup_uses_global_blocklist_unless_overridden(
+    hass, enable_custom_integrations, options, effective
+):
+    entry = _entry(hass, **options)
+    await async_set_api_key(hass, "global-key")
+    await async_update_global_blocklist(hass, add=BLOCKED_CHANNEL)
+
+    with patch.object(runtime.TVRuntime, "async_start"):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+
+    tv = entry.runtime_data
+    assert tv._scheduler._blocked_channels == effective
+    assert tv._client.api_helper.apikey == "global-key"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_blocked_channel_dismisses_once_without_sponsorblock_or_duration(hass):
+    tv = _playback_runtime(hass, blocked_channels=frozenset({BLOCKED_CHANNEL}))
+    client = tv._client
+    with (
+        patch.object(
+            client.api_helper,
+            "get_channel_id",
+            new_callable=AsyncMock,
+            return_value=BLOCKED_CHANNEL,
+        ) as lookup,
+        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+    ):
+        try:
+            await client._process_event("nowPlaying", [{"videoId": "video", "state": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+        finally:
+            await tv._scheduler.cancel()
+
+    lookup.assert_awaited_once_with("video")
+    command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+    assert tv.snapshot.last_short_disruption is None
+    assert tv.snapshot.skip_count == 0
+
+
+@pytest.mark.parametrize("change", ["ad", "different_video"])
+async def test_channel_dismissal_rechecks_playback_after_waiting_for_command_lock(hass, change):
+    tv = _playback_runtime(hass, blocked_channels=frozenset({BLOCKED_CHANNEL}))
+    client = tv._client
+    ready_to_dismiss = asyncio.Event()
+    press_back = client.press_back
+
+    async def observe_back(**kwargs):
+        ready_to_dismiss.set()
+        return await press_back(**kwargs)
+
+    with (
+        patch.object(
+            client.api_helper,
+            "get_channel_id",
+            new_callable=AsyncMock,
+            return_value=BLOCKED_CHANNEL,
+        ),
+        patch.object(client, "press_back", side_effect=observe_back),
+        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+    ):
+        try:
+            async with client._command_mutex:
+                await client._process_event("nowPlaying", [{"videoId": "video", "state": "1"}])
+                await asyncio.wait_for(ready_to_dismiss.wait(), timeout=1)
+                if change == "ad":
+                    await client._process_event("adPlaying", [{}])
+                else:
+                    # Keep the queued work alive to exercise the final command guard itself.
+                    with patch.object(client, "_state_callback", None):
+                        await client._process_event(
+                            "nowPlaying", [{"videoId": "new-video", "state": "1"}]
+                        )
+            await asyncio.gather(*tv._scheduler._tasks)
+        finally:
+            await tv._scheduler.cancel()
+
+    command.assert_not_awaited()
+
+
+async def test_channel_lookup_failure_falls_through_to_sponsorblock(hass):
+    tv = _playback_runtime(
+        hass, blocked_channels=frozenset({BLOCKED_CHANNEL}), skip_categories=["sponsor"]
+    )
+    client = tv._client
+    segment = {"start": 0, "end": 12, "UUID": ["segment"]}
+    session = SimpleNamespace(get=Mock(side_effect=TimeoutError))
+    with (
+        patch.object(client.api_helper, "web_session", session),
+        patch.object(
+            client.api_helper, "get_segments", new_callable=AsyncMock, return_value=[segment]
+        ) as segments,
+        patch.object(client.api_helper, "mark_viewed_segments") as mark_viewed,
+        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+    ):
+        try:
+            await client._process_event(
+                "nowPlaying", [{"videoId": "video", "state": "1", "currentTime": "0"}]
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+        finally:
+            await tv._scheduler.cancel()
+
+    session.get.assert_called_once()
+    segments.assert_awaited_once_with("video")
+    command.assert_awaited_once_with("seekTo", {"newTime": 12})
+    mark_viewed.assert_awaited_once_with(["segment"])
+    assert tv.snapshot.skip_count == 1
 
 
 async def test_integration_debug_logging_traces_ad_skip_and_shorts(

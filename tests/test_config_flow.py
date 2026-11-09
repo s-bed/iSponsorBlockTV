@@ -28,6 +28,8 @@ pytestmark = pytest.mark.asyncio
 SCREEN_ID = "A" * 64
 SECOND_ID = "B" * 64
 UDN = "uuid:test-tv"
+FIRST_CHANNEL = "UC" + "a" * 22
+SECOND_CHANNEL = "UC" + "b" * 22
 
 
 async def _start_manual(hass, step):
@@ -210,3 +212,61 @@ async def test_settings_allow_empty_categories_and_reload_only_selected_tv(
     assert entry.options["use_proxy"]
     assert entry.options["sponsorblock_api_url"] == "https://example.com/api/"
     assert other.options == {}
+
+
+async def test_channel_picker_uses_global_key_and_saves_selected_id_for_this_tv(
+    hass, enable_custom_integrations
+):
+    first = MockConfigEntry(domain=DOMAIN, data={CONF_SCREEN_ID: SCREEN_ID})
+    second = MockConfigEntry(domain=DOMAIN, data={CONF_SCREEN_ID: SECOND_ID})
+    first.add_to_hass(hass)
+    second.add_to_hass(hass)
+    options = hass.config_entries.options
+
+    form = await options.async_init(first.entry_id)
+    menu = await options.async_configure(form["flow_id"], {"channel_settings": "global"})
+    form = await options.async_configure(menu["flow_id"], {"next_step_id": "global_api_key"})
+    with patch.object(config_flow, "async_validate_api_key") as validate:
+        result = await options.async_configure(form["flow_id"], {"api_key": "example-key"})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert validate.await_args.args[1:] == ("example-key",)
+    assert first.options == second.options == {}
+
+    form = await options.async_init(second.entry_id)
+    menu = await options.async_configure(form["flow_id"], {"channel_settings": "tv"})
+    menu = await options.async_configure(menu["flow_id"], {"next_step_id": "tv_blocklist"})
+    form = await options.async_configure(menu["flow_id"], {"next_step_id": "channel_search"})
+    matches = [
+        config_flow.ChannelSearchResult(FIRST_CHANNEL, "Channel name", "First description"),
+        config_flow.ChannelSearchResult(SECOND_CHANNEL, "Channel name", "Second description"),
+    ]
+    with patch.object(config_flow, "async_search_channels", return_value=matches) as search:
+        choice = await options.async_configure(form["flow_id"], {"query": "Channel name"})
+    assert search.await_args.args[1:] == ("example-key", "Channel name")
+    assert choice["step_id"] == "channel_select"
+    selector = next(iter(choice["data_schema"].schema.values()))
+    choices = selector.config["options"]
+    assert [item["value"] for item in choices] == [FIRST_CHANNEL, SECOND_CHANNEL]
+    assert all("Channel name" in item["label"] for item in choices)
+    assert choices[0]["label"] != choices[1]["label"]
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        result = await options.async_configure(choice["flow_id"], {"channel_id": SECOND_CHANNEL})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    reload.assert_called_once_with(second.entry_id)
+    assert second.options["channel_blocklist"] == [SECOND_CHANNEL]
+    assert not second.options.get("override_channel_blocklist", False)
+    assert first.options == {}
+
+    for override in (True, False):
+        form = await options.async_init(second.entry_id)
+        menu = await options.async_configure(form["flow_id"], {"channel_settings": "tv"})
+        form = await options.async_configure(menu["flow_id"], {"next_step_id": "tv_blocklist_mode"})
+        with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+            result = await options.async_configure(
+                form["flow_id"], {"override_channel_blocklist": override}
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        reload.assert_called_once_with(second.entry_id)
+        assert second.options["override_channel_blocklist"] is override
+        assert second.options["channel_blocklist"] == [SECOND_CHANNEL]

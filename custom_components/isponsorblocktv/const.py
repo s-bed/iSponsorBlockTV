@@ -19,7 +19,8 @@ DEFAULT_OPTIONS = {
     "skip_count_tracking": True,
     "join_name": "iSponsorBlockTV",
     "sponsorblock_api_url": SponsorBlock_api,
-    "apikey": "",
     "channel_whitelist": [],
+    "override_channel_blocklist": False,
+    "channel_blocklist": [],
     "use_proxy": False,
 }

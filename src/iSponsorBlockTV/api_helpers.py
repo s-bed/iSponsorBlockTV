@@ -1,8 +1,10 @@
 import html
 import logging
-from asyncio import FIRST_COMPLETED, Task, create_task, wait
+from asyncio import FIRST_COMPLETED, Task, create_task, gather, shield, timeout, wait
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Collection
 from hashlib import sha256
+from time import monotonic
 from typing import TypeVar
 
 from aiohttp import ClientError, ClientSession
@@ -14,6 +16,10 @@ from .conditional_ttl_cache import AsyncConditionalTTL
 
 _T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
+_CHANNEL_CACHE_SIZE = 256
+_CHANNEL_CACHE_TTL = 24 * 60 * 60
+_CHANNEL_MISS_TTL = 5
+_CHANNEL_LOOKUP_TIMEOUT = 3
 
 
 def list_to_tuple(function):
@@ -65,6 +71,8 @@ class ApiHelper:
         self.num_devices = len(config.devices)
         self.minimum_skip_length = config.minimum_skip_length
         self.sponsorblock_api_url = config.sponsorblock_api_url
+        self._channel_cache: OrderedDict[str, tuple[str | None, float]] = OrderedDict()
+        self._channel_lookups: dict[str, Task[str | None]] = {}
 
     @staticmethod
     def _normalize_pairing_code(pairing_code):
@@ -117,28 +125,70 @@ class ApiHelper:
                 return i["id"]["videoId"], i["snippet"]["channelId"]
         return
 
-    @AsyncLRU(maxsize=100)
     async def is_whitelisted(self, vid_id):
         if self.apikey and self.channel_whitelist:
-            channel_id = await self.__get_channel_id(vid_id)
-            # check if channel id is in whitelist
-            for i in self.channel_whitelist:
-                if i["id"] == channel_id:
-                    return True
+            channel_id = await self.get_channel_id(vid_id)
+            return channel_id is not None and any(
+                channel["id"] == channel_id for channel in self.channel_whitelist
+            )
         return False
 
-    async def __get_channel_id(self, vid_id):
-        params = {"id": vid_id, "key": self.apikey, "part": "snippet"}
-        url = constants.Youtube_api + "videos"
-        async with self.web_session.get(url, params=params) as resp:
-            data = await resp.json()
+    async def get_channel_id(self, vid_id: str) -> str | None:
+        """Resolve a video to its channel, sharing lookups between playback rules."""
+        if not self.apikey:
+            return None
+        if (cached := self._channel_cache.get(vid_id)) is not None:
+            channel_id, expires = cached
+            if monotonic() < expires:
+                self._channel_cache.move_to_end(vid_id)
+                return channel_id
+            del self._channel_cache[vid_id]
 
-        if "error" in data or not data.get("items"):
-            return
-        data = data["items"][0]
-        if data["kind"] != "youtube#video":
-            return
-        return data["snippet"]["channelId"]
+        if (lookup := self._channel_lookups.get(vid_id)) is None:
+            lookup = self._channel_lookups[vid_id] = create_task(self._lookup_channel_id(vid_id))
+            lookup.add_done_callback(lambda _: self._channel_lookups.pop(vid_id, None))
+        # A new playback sample can replace a waiter while the lookup is still useful.
+        return await shield(lookup)
+
+    async def cancel_channel_lookups(self) -> None:
+        """Stop metadata requests before shutting down their owner."""
+        tasks = tuple(self._channel_lookups.values())
+        for task in tasks:
+            task.cancel()
+        await gather(*tasks, return_exceptions=True)
+
+    async def _lookup_channel_id(self, vid_id: str) -> str | None:
+        channel_id = await self._fetch_channel_id(vid_id)
+        ttl = _CHANNEL_CACHE_TTL if channel_id is not None else _CHANNEL_MISS_TTL
+        self._channel_cache[vid_id] = (channel_id, monotonic() + ttl)
+        if len(self._channel_cache) > _CHANNEL_CACHE_SIZE:
+            self._channel_cache.popitem(last=False)
+        return channel_id
+
+    async def _fetch_channel_id(self, vid_id: str) -> str | None:
+        params = {
+            "id": vid_id,
+            "part": "snippet",
+            "fields": "items(snippet/channelId)",
+        }
+        headers = {"X-Goog-Api-Key": self.apikey}
+        try:
+            url = constants.Youtube_api + "videos"
+            async with (
+                timeout(_CHANNEL_LOOKUP_TIMEOUT),
+                self.web_session.get(url, params=params, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    _LOGGER.debug("YouTube channel lookup returned HTTP %s", resp.status)
+                    return None
+                data = await resp.json()
+            if not data["items"]:
+                return None
+            channel_id = data["items"][0]["snippet"]["channelId"]
+            return channel_id if isinstance(channel_id, str) and channel_id else None
+        except (ClientError, KeyError, RuntimeError, TimeoutError, TypeError, ValueError) as err:
+            _LOGGER.debug("YouTube channel lookup failed (%s)", type(err).__name__)
+            return None
 
     @AsyncLRU(maxsize=10)
     async def search_channels(self, channel):
