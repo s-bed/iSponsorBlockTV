@@ -140,12 +140,13 @@ class PlaybackScheduler:
             if self._pending is asyncio.current_task():
                 self._pending = None
 
-    async def cancel(self):
-        """Stop all pending work and discard the previous playback sample."""
+    async def cancel(self, *, reset: bool = True):
+        """Stop pending work and optionally clear the record of recent commands."""
         tasks = tuple(self._tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending = None
-        self._last_skip = None
-        self._disturbed_video = None
+        if reset:
+            self._last_skip = None
+            self._disturbed_video = None

@@ -81,7 +81,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.mute_ads = config.mute_ads if config else False
         self.skip_ads = config.skip_ads if config else False
         self._muted_for_ad = False
-        self.last_event_time = 0
+        self.last_event_time: float | None = None
         self._command_mutex = asyncio.Lock()
         self._ad_mutex = asyncio.Lock()
 
@@ -109,6 +109,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.ad_playing = None
         self.ad_skippable = None
         self._notify_update()
+
+    def reset_session(self) -> None:
+        """Discard the local session and playback state."""
+        self._connection_lost()
+        self.reset_playback()
 
     def _notify_update(self):
         if self._on_update is not None:
@@ -160,21 +165,28 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         if self._state_callback:
             await self._state_callback(self.playback_state)
 
-    async def _watchdog(self):
+    async def _watchdog(self, started_at: float):
         """Finish a subscription that has stopped receiving events."""
         loop = asyncio.get_running_loop()
-        while loop.time() - self.last_event_time <= 60:
+        while loop.time() - (self.last_event_time or started_at) <= 60:
             await asyncio.sleep(10)
         self.logger.debug("YouTube Lounge subscription stopped receiving events")
 
-    async def run_subscription(self, callback):
-        """Run the subscription until disconnect, failure, or cancellation."""
+    async def run_subscription(self, callback, *, resume: bool = False) -> bool:
+        """Run the event stream and report whether it received events."""
         self._state_callback = callback
-        if self.playback_state is not None:
+        if resume:
+            # A partial playback event must not inherit the previous video's ID or duration.
+            self.playback_state = None
+        elif self.playback_state is not None:
             await callback(self.playback_state)
-        self.last_event_time = asyncio.get_running_loop().time()
+        self.last_event_time = None
         subscription = self._subscription = asyncio.create_task(super().subscribe())
-        watchdog = self._watchdog_task = asyncio.create_task(self._watchdog())
+        watchdog = self._watchdog_task = asyncio.create_task(
+            self._watchdog(asyncio.get_running_loop().time())
+        )
+        if resume:
+            self._start_action(self.get_now_playing)
         self.logger.debug("Listening for YouTube Lounge events")
         try:
             done, _ = await asyncio.wait(
@@ -188,6 +200,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 )
         finally:
             await self.stop_subscription()
+        return self.last_event_time is not None
 
     async def stop_subscription(self):
         """Cancel and wait for subscription and event-triggered work."""
@@ -404,16 +417,20 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         async with asyncio.timeout(_REQUEST_TIMEOUT):
             return await super().is_available()
 
+    async def restore_ad_mute(self) -> None:
+        """Restore audio muted by this client while a session is available."""
+        if self.connected() and self._muted_for_ad:
+            try:
+                async with asyncio.timeout(1):
+                    if await self.mute(False, override=True):
+                        self._muted_for_ad = False
+            except Exception as err:  # noqa: BLE001
+                self.logger.debug("Could not restore TV volume (%s)", type(err).__name__)
+
     async def disconnect(self) -> bool:
         try:
             async with asyncio.timeout(_REQUEST_TIMEOUT):
-                if self.connected() and self._muted_for_ad:
-                    try:
-                        async with asyncio.timeout(1):
-                            if await self.mute(False, override=True):
-                                self._muted_for_ad = False
-                    except Exception as err:  # noqa: BLE001
-                        self.logger.debug("Could not restore TV volume (%s)", type(err).__name__)
+                await self.restore_ad_mute()
                 if self.connected():
                     self.logger.debug("Sending YouTube Lounge disconnect request")
                     acknowledged = await super().disconnect()

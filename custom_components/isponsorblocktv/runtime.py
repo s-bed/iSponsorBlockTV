@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, NotRequired, TypedDict
 
-from aiohttp import ClientSession
+from aiohttp import ClientError, ClientSession
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -26,6 +26,8 @@ from .core.ytlounge import YtLoungeApi
 AUTH_CHECK_INTERVAL = 15 * 60
 RETRY_INTERVAL = 10
 MAX_RETRY_INTERVAL = 60
+STREAM_RETRY_DELAY = 1
+STREAM_RETRY_LIMIT = 2
 DISCONNECT_TIMEOUT = 3
 ACTIVITY_SAVE_DELAY = 5
 PLAYBACK_STATES = {
@@ -231,6 +233,12 @@ class TVRuntime:
         return screen.lounge_token
 
     async def _async_run(self) -> None:
+        try:
+            await self._async_connect_loop()
+        finally:
+            await self._async_cleanup(terminate=True)
+
+    async def _async_connect_loop(self) -> None:
         retry = RETRY_INTERVAL
         while True:
             try:
@@ -259,44 +267,69 @@ class TVRuntime:
             except Exception as err:  # noqa: BLE001
                 # HTTP errors can include Lounge credentials in their URLs.
                 self._logger.debug("YouTube connection failed (%s)", type(err).__name__)
-            finally:
-                self._async_publish(
-                    connected=False,
-                    playback_state=None,
-                    ad_playing=None,
-                    ad_skippable=None,
-                    video_id=None,
-                    duration=None,
-                    playback_speed=None,
-                    volume=None,
-                    muted=None,
-                )
-                await self._client.stop_subscription()
-                await self._scheduler.cancel()
-                try:
-                    async with asyncio.timeout(DISCONNECT_TIMEOUT):
-                        await self._client.disconnect()
-                except Exception as err:  # noqa: BLE001
-                    self._logger.debug("YouTube Lounge disconnect failed (%s)", type(err).__name__)
-                self._client.reset_playback()
 
+            await self._async_cleanup()
             self._logger.debug("Retrying YouTube Lounge connection in %s s", retry)
             await asyncio.sleep(retry)
             retry = min(retry * 2, MAX_RETRY_INTERVAL)
 
+    async def _async_cleanup(self, *, terminate: bool = False) -> None:
+        self._async_publish(
+            connected=False,
+            playback_state=None,
+            ad_playing=None,
+            ad_skippable=None,
+            video_id=None,
+            duration=None,
+            playback_speed=None,
+            volume=None,
+            muted=None,
+        )
+        await self._client.stop_subscription()
+        await self._scheduler.cancel()
+        if terminate:
+            try:
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await self._client.disconnect()
+            except Exception as err:  # noqa: BLE001
+                self._logger.debug("YouTube Lounge disconnect failed (%s)", type(err).__name__)
+        else:
+            await self._client.restore_ad_mute()
+        self._client.reset_session()
+
     async def _async_listen(self) -> None:
-        subscription = asyncio.create_task(self._client.run_subscription(self._scheduler))
-        try:
-            while True:
-                done, _ = await asyncio.wait({subscription}, timeout=AUTH_CHECK_INTERVAL)
-                if done:
-                    await subscription
-                    return
-                # Validate the saved ID without replacing the token of the live session.
-                await self._async_verify()
-        finally:
-            subscription.cancel()
-            await asyncio.gather(subscription, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        verify_at = loop.time() + AUTH_CHECK_INTERVAL
+        retries = 0
+        while True:
+            subscription = asyncio.create_task(
+                self._client.run_subscription(self._scheduler, resume=retries > 0)
+            )
+            try:
+                while not subscription.done():
+                    await asyncio.wait({subscription}, timeout=max(0, verify_at - loop.time()))
+                    if loop.time() >= verify_at:
+                        # Validate the saved ID without replacing the live session's token.
+                        await self._async_verify()
+                        verify_at = loop.time() + AUTH_CHECK_INTERVAL
+                try:
+                    if await subscription:
+                        retries = 0
+                except (ClientError, TimeoutError) as err:
+                    self._logger.debug(
+                        "YouTube Lounge event stream failed (%s)", type(err).__name__
+                    )
+            finally:
+                subscription.cancel()
+                await asyncio.gather(subscription, return_exceptions=True)
+
+            if not self._client.connected() or retries >= STREAM_RETRY_LIMIT:
+                return
+            await self._scheduler.cancel(reset=False)
+            retries += 1
+            delay = STREAM_RETRY_DELAY * retries
+            self._logger.debug("Reopening YouTube Lounge event stream in %s s", delay)
+            await asyncio.sleep(delay)
 
 
 ISponsorBlockTVConfigEntry = ConfigEntry[TVRuntime]
