@@ -9,14 +9,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 
 from aiohttp import ClientSession
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 from pyytlounge.models import State
 
-from .const import CONF_SCREEN_ID
+from .const import CONF_SCREEN_ID, DOMAIN
 from .core.api_helpers import ApiHelper
 from .core.pairing import PairingRejected, PairingUnavailable, async_verify_screen_id
 from .core.playback import PlaybackScheduler
@@ -26,6 +27,7 @@ AUTH_CHECK_INTERVAL = 15 * 60
 RETRY_INTERVAL = 10
 MAX_RETRY_INTERVAL = 60
 DISCONNECT_TIMEOUT = 3
+SKIP_STATS_SAVE_DELAY = 5
 PLAYBACK_STATES = {
     State.Stopped: "idle",
     State.Buffering: "idle",  # YouTube sends this value when playback ends.
@@ -35,6 +37,18 @@ PLAYBACK_STATES = {
     State.Cued: "idle",
     State.Advertisement: "playing",
 }
+
+
+class SkipStats(TypedDict):
+    """The two values retained between Home Assistant sessions."""
+
+    count: int
+    last_skip: str | None
+
+
+def skip_stats_store(hass: HomeAssistant, entry_id: str) -> Store[SkipStats]:
+    """Open storage for one TV's skip totals."""
+    return Store(hass, 1, f"{DOMAIN}.{entry_id}.skips", atomic_writes=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +87,8 @@ class TVRuntime:
         self._listeners: set[Callable[[], None]] = set()
         self._task: asyncio.Task[None] | None = None
         self._rejections = 0
+        self._skip_store = skip_stats_store(hass, entry.entry_id)
+        self._skip_stats_changed = False
         self.snapshot = TVSnapshot()
 
         config = SimpleNamespace(
@@ -107,6 +123,16 @@ class TVRuntime:
             ),
         )
 
+    async def async_restore_skip_stats(self) -> None:
+        """Load the saved total before exposing the sensors."""
+        if (stats := await self._skip_store.async_load()) is not None:
+            last_skip = stats["last_skip"]
+            self.snapshot = replace(
+                self.snapshot,
+                skip_count=stats["count"],
+                last_skip=datetime.fromisoformat(last_skip) if last_skip else None,
+            )
+
     @callback
     def async_start(self) -> None:
         """Start the config entry's background worker."""
@@ -115,11 +141,14 @@ class TVRuntime:
         )
 
     async def async_stop(self) -> None:
-        """Cancel and await the worker."""
+        """Stop playback work and flush the total before the entry reloads."""
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+        if self._skip_stats_changed:
+            await self._skip_store.async_save(self._skip_stats_data())
+            self._skip_stats_changed = False
 
     @callback
     def async_subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -156,6 +185,16 @@ class TVRuntime:
     @callback
     def _async_skipped(self) -> None:
         self._async_publish(skip_count=self.snapshot.skip_count + 1, last_skip=datetime.now(UTC))
+        self._skip_stats_changed = True
+        self._skip_store.async_delay_save(self._skip_stats_data, SKIP_STATS_SAVE_DELAY)
+
+    @callback
+    def _skip_stats_data(self) -> SkipStats:
+        last_skip = self.snapshot.last_skip
+        return {
+            "count": self.snapshot.skip_count,
+            "last_skip": last_skip.isoformat() if last_skip else None,
+        }
 
     async def _async_verify(self) -> str:
         try:

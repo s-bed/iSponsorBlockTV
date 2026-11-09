@@ -41,9 +41,11 @@ rejects a saved pairing, use **Settings → System → Repairs** to enter a fres
 code. **Reconfigure** on the TV's integration entry also lets you re-pair it.
 
 The TV exposes connection and pairing status, playback and ad state, and
-SponsorBlock skip activity. The skip count and last-skip timestamp cover the
-current integration load. Additional video and audio sensors can be enabled
-from the device page.
+SponsorBlock skip activity. **Lifetime SponsorBlock skips** and **Last
+SponsorBlock skip** are saved per TV across restarts and reloads, independently
+of Home Assistant Recorder. Totals start at zero when upgrading from the
+session-only counter. Additional video and audio sensors can be enabled from the
+device page.
 
 **Disturb short videos** is enabled by default for each TV. Once YouTube reports
 that a video is playing and gives its duration, iSponsorBlockTV sends a Back
@@ -74,6 +76,22 @@ The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
 request, whether YouTube acknowledged the request, and whether a disconnect
 triggered the Shorts workaround. An acknowledgment confirms the request was
 accepted. The following playback events show what the TV did.
+
+#### Keep live states without history
+
+Use Home Assistant's [Recorder exclusions](https://www.home-assistant.io/integrations/recorder/#configure-filter)
+to stop storing state changes from iSponsorBlockTV. In **Developer Tools →
+Template**, render this template to get the current entity IDs for your TVs.
+
+```jinja
+recorder:
+  exclude:
+    entities: {{ integration_entities('isponsorblocktv') | sort | to_json }}
+```
+
+Merge the rendered list into `recorder.exclude.entities` in `configuration.yaml`
+and restart Home Assistant. Refresh the list after enabling, adding, or renaming
+an entity. Current sensor values and lifetime skip totals remain available.
 
 #### Releases and previews
 
