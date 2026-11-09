@@ -47,7 +47,7 @@ def entry() -> MockConfigEntry:
 
 @pytest.mark.asyncio
 async def test_sensors(hass: HomeAssistant, entry: MockConfigEntry) -> None:
-    """Publish telemetry and preserve session statistics when the app closes."""
+    """Publish telemetry and preserve skip statistics when the app closes."""
     entities = []
     await sensor.async_setup_entry(hass, entry, entities.extend)
     sensors = {entity.entity_description.key: entity for entity in entities}
@@ -183,3 +183,56 @@ async def test_packaged_entry_registers_device_and_entities(hass: HomeAssistant)
 
     assert entry.state is ConfigEntryState.NOT_LOADED
     assert hass.states.get(connection).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.asyncio
+async def test_skip_statistics_survive_reload_per_tv(hass: HomeAssistant) -> None:
+    """Restore the latest skip statistics and preserve the existing count entity ID."""
+    entry = MockConfigEntry(domain=DOMAIN, title="Living Room", data={CONF_SCREEN_ID: "living"})
+    other = MockConfigEntry(domain=DOMAIN, title="Bedroom", data={CONF_SCREEN_ID: "bedroom"})
+    entry.add_to_hass(hass)
+    other.add_to_hass(hass)
+    registry = er.async_get(hass)
+    count = registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{entry.entry_id}_skip_count",
+        suggested_object_id="living_room_sponsorblock_skips_since_load",
+        config_entry=entry,
+    ).entity_id
+
+    with (
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=SimpleNamespace(lounge_token="example-token"),
+        ),
+        patch.object(runtime.YtLoungeApi, "is_available", return_value=False),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert other.state is ConfigEntryState.LOADED
+        last_skip = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_last_skip")
+        assert last_skip is not None
+        previous_runtime = entry.runtime_data
+        previous_runtime._async_skipped()
+        previous_runtime._async_skipped()
+        skip_time = previous_runtime.snapshot.last_skip
+        assert skip_time is not None
+        assert hass.states.get(count).state == "2"
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data is not previous_runtime
+        assert hass.states.get(count).state == "2"
+        assert hass.states.get(last_skip).state == skip_time.isoformat(timespec="seconds")
+        assert entry.runtime_data.snapshot.last_skip == skip_time
+        assert other.runtime_data.snapshot.skip_count == 0
+        assert other.runtime_data.snapshot.last_skip is None
+
+        entry.runtime_data._async_skipped()
+        assert hass.states.get(count).state == "3"
+        assert await hass.config_entries.async_remove(entry.entry_id) == {"require_restart": False}
+        assert await runtime.skip_stats_store(hass, entry.entry_id).async_load() is None
+        assert await hass.config_entries.async_unload(other.entry_id)

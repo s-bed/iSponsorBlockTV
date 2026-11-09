@@ -41,9 +41,57 @@ rejects a saved pairing, use **Settings → System → Repairs** to enter a fres
 code. **Reconfigure** on the TV's integration entry also lets you re-pair it.
 
 The TV exposes connection and pairing status, playback and ad state, and
-SponsorBlock skip activity. The skip count and last-skip timestamp cover the
-current integration load. Additional video and audio sensors can be enabled
-from the device page.
+SponsorBlock skip activity. **Lifetime SponsorBlock skips** and **Last
+SponsorBlock skip** are saved per TV across restarts and reloads, independently
+of Home Assistant Recorder. Totals start at zero when upgrading from the
+session-only counter. Additional video and audio sensors can be enabled from the
+device page.
+
+**Disturb short videos** is enabled by default for each TV. Once YouTube reports
+that a video is playing and gives its duration, iSponsorBlockTV sends a Back
+command to dismiss videos shorter than the configured threshold (30 seconds by
+default). This also applies to regular videos under the threshold. Videos at or
+above the threshold and ads are excluded. Turn the option off for any TV where
+you want short videos to play.
+
+YouTube can show the Shorts connection warning before it reports a video's
+duration. With **Disturb short videos** enabled, iSponsorBlockTV sends Back once
+if it reconnects within 60 seconds of YouTube reporting a screen-initiated user
+disconnect. This can also happen when you manually disconnect from the TV for
+another reason.
+
+Home Assistant's
+[Android TV Remote](https://www.home-assistant.io/integrations/androidtv_remote/#data-updates)
+uses the TV's local remote service and can navigate YouTube without creating a
+Lounge session. Its API lacks the playback duration needed for this rule.
+
+#### Playback troubleshooting
+
+In **Settings → Devices & services → iSponsorBlockTV**, open the integration menu
+and select **Enable debug logging**. Reproduce the playback or disconnect issue,
+then select **Disable debug logging** to download the Home Assistant log. Search
+for `custom_components.isponsorblocktv` and your TV's integration name.
+
+The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
+request, whether YouTube acknowledged the request, and whether a disconnect
+triggered the Shorts workaround. An acknowledgment confirms the request was
+accepted. The following playback events show what the TV did.
+
+#### Keep live states without history
+
+Use Home Assistant's [Recorder exclusions](https://www.home-assistant.io/integrations/recorder/#configure-filter)
+to stop storing state changes from iSponsorBlockTV. In **Developer Tools →
+Template**, render this template to get the current entity IDs for your TVs.
+
+```jinja
+recorder:
+  exclude:
+    entities: {{ integration_entities('isponsorblocktv') | sort | to_json }}
+```
+
+Merge the rendered list into `recorder.exclude.entities` in `configuration.yaml`
+and restart Home Assistant. Refresh the list after enabling, adding, or renaming
+an entity. Current sensor values and lifetime skip totals remain available.
 
 #### Releases and previews
 

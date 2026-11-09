@@ -178,12 +178,26 @@ async def test_settings_allow_empty_categories_and_reload_only_selected_tv(
     other.add_to_hass(hass)
     options = hass.config_entries.options
     form = await options.async_init(entry.entry_id)
+    defaults = form["data_schema"]({})
+    assert defaults["disturb_short_videos"] is True
+    assert defaults["short_video_duration_threshold"] == 30
+
+    invalid = await options.async_configure(
+        form["flow_id"], {"short_video_duration_threshold": "nan"}
+    )
+    assert invalid["errors"] == {
+        "short_video_duration_threshold": "invalid_short_video_duration_threshold"
+    }
+    assert invalid["data_schema"]({})["short_video_duration_threshold"] == 30
+
     with patch.object(hass.config_entries, "async_schedule_reload") as reload:
         result = await options.async_configure(
             form["flow_id"],
             {
                 "skip_categories": [],
                 "mute_ads": True,
+                "disturb_short_videos": False,
+                "short_video_duration_threshold": 45,
                 "advanced": {"sponsorblock_api_url": "https://example.com/api", "use_proxy": True},
             },
         )
@@ -191,6 +205,8 @@ async def test_settings_allow_empty_categories_and_reload_only_selected_tv(
     reload.assert_called_once_with(entry.entry_id)
     assert entry.options["skip_categories"] == []
     assert entry.options["mute_ads"]
+    assert entry.options["disturb_short_videos"] is False
+    assert entry.options["short_video_duration_threshold"] == 45
     assert entry.options["use_proxy"]
     assert entry.options["sponsorblock_api_url"] == "https://example.com/api/"
     assert other.options == {}

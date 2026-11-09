@@ -1,15 +1,27 @@
 """Exercise the Home Assistant connection and pairing state transitions."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
+import pyytlounge
+import pytest
+from aiohttp import ClientError
+from custom_components.isponsorblocktv.core import ytlounge
 from custom_components.isponsorblocktv.core.pairing import (
     PairedScreen,
     PairingRejected,
     PairingUnavailable,
 )
+from homeassistant.components.logger.helpers import (
+    DATA_LOGGER,
+    LoggerSetting,
+    LogPersistance,
+    LogSettingsType,
+)
 from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.helpers import issue_registry
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.isponsorblocktv import runtime
@@ -22,6 +34,238 @@ def _entry(hass):
     entry = MockConfigEntry(domain=DOMAIN, data={"screen_id": SCREEN_ID}, title="Living room TV")
     entry.add_to_hass(hass)
     return entry
+
+
+def _playback_runtime(hass, **options):
+    tv = runtime.TVRuntime(
+        hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": [], **options}
+    )
+    tv._client._state_callback = tv._scheduler
+    tv._client._sid = tv._client._gsession = "connected"
+    return tv
+
+
+@pytest.mark.parametrize(
+    ("options", "duration", "dismiss"),
+    [
+        ({}, "29.9", True),
+        ({}, "30", False),
+        ({"short_video_duration_threshold": 45}, "30", True),
+        ({"disturb_short_videos": False}, "20", False),
+        ({}, None, False),
+        ({}, "0", False),
+    ],
+)
+async def test_short_video_dismissal_uses_this_tvs_options(hass, options, duration, dismiss):
+    tv = _playback_runtime(hass, **options)
+    client = tv._client
+    sample = {"videoId": "video", "state": "1", "currentTime": "0"}
+    if duration is not None:
+        sample["duration"] = duration
+
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            await client._process_event("nowPlaying", [sample])
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            if dismiss:
+                command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+                await client._process_event(
+                    "nowPlaying", [{**sample, "videoId": "next", "state": "3"}]
+                )
+                await asyncio.gather(*tv._scheduler._tasks)
+                assert command.await_count == 1
+                await client._process_event("onStateChange", [{"state": "1", "currentTime": "0"}])
+                await asyncio.gather(*tv._scheduler._tasks)
+                assert command.await_count == 2
+            else:
+                command.assert_not_awaited()
+        finally:
+            await tv._scheduler.cancel()
+
+    assert tv.snapshot.skip_count == 0
+
+
+async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "video", "state": "1081", "currentTime": "0", "duration": "18"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "1"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            assert client.playback_state.duration is None
+        finally:
+            await tv._scheduler.cancel()
+
+    command.assert_not_awaited()
+
+
+async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_video(hass):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+        try:
+            async with client._command_mutex:
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "short", "state": "1", "currentTime": "0", "duration": "18"}],
+                )
+                await asyncio.sleep(0)
+                queued = tv._scheduler._pending
+                assert queued is not None
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "long", "state": "1", "currentTime": "0", "duration": "65"}],
+                )
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+            await asyncio.gather(*tv._scheduler._tasks)
+        finally:
+            await tv._scheduler.cancel()
+
+    command.assert_not_awaited()
+
+
+async def test_integration_debug_logging_traces_ad_skip_and_shorts(
+    hass, enable_custom_integrations, caplog
+):
+    entry = _entry(hass)
+    tv = runtime.TVRuntime(
+        hass, entry, None, {**DEFAULT_OPTIONS, "skip_ads": True, "disturb_short_videos": False}
+    )
+    client = tv._client
+    client.auth.lounge_id_token = "private-lounge-token"
+    caplog.set_level(logging.INFO)
+    caplog.handler.setLevel(logging.DEBUG)
+
+    await client._process_event("nowPlaying", [{"state": "1"}])
+    assert "YouTube nowPlaying" not in caplog.text
+
+    logger_class = logging.getLoggerClass()
+    try:
+        assert await async_setup_component(hass, "logger", {})
+    finally:
+        logging.setLoggerClass(logger_class)
+    settings = hass.data[DATA_LOGGER].settings
+    await settings.async_update(
+        hass, DOMAIN, LoggerSetting("DEBUG", LogPersistance.NONE, LogSettingsType.INTEGRATION)
+    )
+
+    with patch.object(
+        pyytlounge.YtLoungeApi,
+        "_command",
+        side_effect=[True, ClientError("https://example.com/?token=private-lounge-token")],
+    ) as command:
+        await client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
+        await asyncio.gather(*client._actions)
+        await client._process_event("onAdStateChange", [{"adState": "1082", "currentTime": "0"}])
+        await client._process_event("onStateChange", [{"state": "2", "currentTime": "8"}])
+        await client._process_event(
+            "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
+        )
+        await client._process_event("onSubtitlesTrackChanged", [{"videoId": "private-video-id"}])
+        await asyncio.gather(*client._actions)
+
+    assert [call.args[0] for call in command.await_args_list] == ["skipAd", "setPlaylist"]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == f"{runtime.__name__}.{entry.title}"
+    ]
+    log = "\n".join(messages)
+    assert "skipAd acknowledged=True" in log
+    assert "ad state code=1082" in log
+    assert "playback Playing -> Paused (state code=2, position=8.0 s" in log
+    assert "reason='disconnectedByUserScreenInitiated', Shorts workaround pending=True" in log
+    assert "setPlaylist ended (ClientError)" in log
+    assert "private-lounge-token" not in caplog.text
+    assert "private-video-id" not in caplog.text
+    assert SCREEN_ID not in caplog.text
+
+    await settings.async_update(
+        hass, DOMAIN, LoggerSetting("NOTSET", LogPersistance.NONE, LogSettingsType.INTEGRATION)
+    )
+    caplog.clear()
+    await client._process_event("onStateChange", [{"state": "1"}])
+    assert "YouTube onStateChange" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("has_bind_playback", "expired"), [(False, False), (True, False), (False, True)]
+)
+async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
+    hass, has_bind_playback, expired
+):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": []})
+    client = tv._client
+    ordinary_reconnect = asyncio.Event()
+    connection_attempt = 0
+    back_attempts = []
+
+    async def connect():
+        nonlocal connection_attempt
+        connection_attempt += 1
+        if connection_attempt == 2:
+            return False
+        client._sid = client._gsession = "connected"
+        if connection_attempt == 3:
+            # YouTube can include the old subtitle track and playback in the bind response.
+            await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
+            if has_bind_playback:
+                await client._process_event(
+                    "nowPlaying",
+                    [{"videoId": "short", "state": "1", "currentTime": "1", "duration": "18"}],
+                )
+        return True
+
+    async def subscribe():
+        if connection_attempt == 1:
+            await client._process_event(
+                "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
+            )
+        elif connection_attempt == 3:
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
+            await asyncio.gather(*client._actions)
+        else:
+            ordinary_reconnect.set()
+            await asyncio.Future()
+
+    async def send_command(_command, _parameters):
+        back_attempts.append(connection_attempt)
+        return True
+
+    with (
+        patch.object(runtime, "RETRY_INTERVAL", 0),
+        patch.object(ytlounge, "monotonic", side_effect=[100, 161 if expired else 110]),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect),
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
+        patch.object(pyytlounge.YtLoungeApi, "_command", side_effect=send_command) as command,
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(ordinary_reconnect.wait(), 5)
+        finally:
+            await tv.async_stop()
+
+    if expired:
+        command.assert_not_awaited()
+    else:
+        command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+        assert back_attempts == [3]
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):
