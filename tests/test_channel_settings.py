@@ -86,10 +86,10 @@ async def test_global_edits_serialize_and_reload_inheriting_tvs(hass):
 
     with patch.object(hass.config_entries, "async_schedule_reload") as reload:
         await asyncio.gather(
-            async_update_global_blocklist(hass, add=FIRST_CHANNEL),
-            async_update_global_blocklist(hass, add=SECOND_CHANNEL),
+            async_update_global_blocklist(hass, add=(FIRST_CHANNEL,)),
+            async_update_global_blocklist(hass, add=(SECOND_CHANNEL,)),
         )
-        await async_update_global_blocklist(hass, add=FIRST_CHANNEL)
+        await async_update_global_blocklist(hass, add=(FIRST_CHANNEL, SECOND_CHANNEL))
     assert [call.args[0] for call in reload.call_args_list] == [tv.entry_id, tv.entry_id]
     assert (await async_get_channel_settings(hass)).blocklist == (FIRST_CHANNEL, SECOND_CHANNEL)
 

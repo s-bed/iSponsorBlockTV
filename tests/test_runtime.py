@@ -171,7 +171,7 @@ async def test_entry_setup_uses_global_blocklist_unless_overridden(
 ):
     entry = _entry(hass, **options)
     await async_set_api_key(hass, "global-key")
-    await async_update_global_blocklist(hass, add=BLOCKED_CHANNEL)
+    await async_update_global_blocklist(hass, add=(BLOCKED_CHANNEL,))
 
     with patch.object(runtime.TVRuntime, "async_start"):
         assert await hass.config_entries.async_setup(entry.entry_id)

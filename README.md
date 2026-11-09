@@ -71,21 +71,21 @@ Lounge session. Its API lacks the playback duration needed for this rule.
 
 #### Block YouTube channels
 
-In any paired TV's integration options, select **Global channel settings
-(all TVs)** under **Open channel settings** and submit. Set the YouTube Data API
-key once, then open the global blocklist to search by channel name or enter a
-channel ID. Select the intended channel from the results. The integration
-saves its ID so the rule survives a rename.
+On the iSponsorBlockTV integration page, open **Configure** on the
+**Global channel settings** entry. Set the YouTube Data API key once, then
+search by channel name or enter a channel ID. You can select multiple results
+in one search. The integration saves the channel IDs so rules survive renames.
 
 Each TV uses the global list by default. To give a TV its own list, choose
-**Channel settings for this TV** and turn on **Override global blocklist**.
+**Channel blocklist for this TV** in that TV's options and turn on
+**Override global blocklist**.
 An empty override disables channel blocking for that TV. Turn the switch off
 to return to the global list while keeping the TV's saved list.
 
 The integration sends Back after the YouTube app reports a video from a blocked
 channel, so playback can start briefly. The shared key also handles existing
 SponsorBlock channel exclusions. If your TVs had different keys before the
-upgrade, enter the key to use in **Global channel settings (all TVs)**.
+upgrade, enter the key to use in **Global channel settings**.
 
 #### Playback troubleshooting
 

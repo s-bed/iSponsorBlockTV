@@ -142,15 +142,14 @@ async def async_set_api_key(hass: HomeAssistant, api_key: str) -> None:
 
 
 async def async_update_global_blocklist(
-    hass: HomeAssistant, *, add: str | None = None, remove: Collection[str] = ()
+    hass: HomeAssistant, *, add: Collection[str] = (), remove: Collection[str] = ()
 ) -> None:
     """Apply an edit to the latest global blocklist and reload inheriting TVs."""
     manager = _manager(hass)
     async with manager.lock:
         current = await manager.async_load()
-        blocklist = tuple(channel for channel in current.blocklist if channel not in remove)
-        if add and add not in blocklist:
-            blocklist += (add,)
+        remaining = (channel for channel in current.blocklist if channel not in remove)
+        blocklist = tuple(dict.fromkeys((*remaining, *add)))
         if blocklist != current.blocklist:
             await manager.async_save(replace(current, blocklist=blocklist))
             manager.schedule_reloads(inheriting_only=True)
