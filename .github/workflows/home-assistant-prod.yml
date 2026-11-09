@@ -1,0 +1,19 @@
+name: Home Assistant production release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: home-assistant-prod
+  queue: max
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main' && !github.event.deleted
+    permissions:
+      contents: write
+    uses: ./.github/workflows/home-assistant-publish.yml
+    with:
+      preview: false

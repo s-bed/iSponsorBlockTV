@@ -1,17 +1,19 @@
 import html
-from hashlib import sha256
+import logging
 from asyncio import FIRST_COMPLETED, Task, create_task, wait
-from typing import AsyncIterator, Collection, TypeVar
+from collections.abc import AsyncIterator, Collection
+from hashlib import sha256
+from typing import TypeVar
 
-from aiohttp import ClientSession
+from aiohttp import ClientError, ClientSession
 from cache import AsyncLRU
 from pyytlounge.wrapper import api_base
 
-from . import chromecast_client, constants, dial_client
+from . import constants
 from .conditional_ttl_cache import AsyncConditionalTTL
 
-
 _T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
 
 
 def list_to_tuple(function):
@@ -43,7 +45,8 @@ async def merge_iterators(iterators: Collection[AsyncIterator[_T]]) -> AsyncIter
                     yield task.result()
                 except StopAsyncIteration:
                     continue
-                except Exception:
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("A discovery source stopped (%s)", type(err).__name__)
                     continue
                 pending_tasks[_as_task(iterator)] = iterator
     finally:
@@ -77,7 +80,7 @@ class ApiHelper:
                 return None
             try:
                 pair_response = await response.json()
-            except BaseException:
+            except (ClientError, ValueError):
                 return None
 
         screen = pair_response.get("screen")
@@ -130,7 +133,7 @@ class ApiHelper:
         async with self.web_session.get(url, params=params) as resp:
             data = await resp.json()
 
-        if "error" in data:
+        if "error" in data or not data.get("items"):
             return
         data = data["items"][0]
         if data["kind"] != "youtube#video":
@@ -195,14 +198,12 @@ class ApiHelper:
         headers = {"Accept": "application/json"}
         url = self.sponsorblock_api_url + "skipSegments/" + vid_id_hashed
         async with self.web_session.get(url, headers=headers, params=params) as response:
+            if response.status == 404:
+                return [], False
+            if response.status != 200:
+                _LOGGER.debug("SponsorBlock segment lookup returned HTTP %s", response.status)
+                return [], False
             response_json = await response.json()
-        if response.status != 200:
-            response_text = await response.text()
-            print(
-                f"Error getting segments for video {vid_id}, hashed as {vid_id_hashed}."
-                f" Code: {response.status} - {response_text}"
-            )
-            return [], True
         for i in response_json:
             if str(i["videoID"]) == str(vid_id):
                 response_json = i
@@ -255,7 +256,7 @@ class ApiHelper:
                 # Only add segments greater than minimum skip length
                 if segment_dict["end"] - segment_dict["start"] > minimum_skip_length:
                     segments.append(segment_dict)
-        except BaseException:
+        except (KeyError, TypeError, ValueError):
             pass
         return segments, ignore_ttl
 
@@ -267,7 +268,8 @@ class ApiHelper:
             for i in uuids:
                 url = self.sponsorblock_api_url + "viewedVideoSponsorTime/"
                 params = {"UUID": i}
-                await self.web_session.post(url, params=params)
+                async with self.web_session.post(url, params=params):
+                    pass
 
     async def discover_youtube_devices_dial(self, active=True):
         """Discovers YouTube devices using DIAL and Chromecast discovery.
@@ -275,6 +277,8 @@ class ApiHelper:
         Yields devices as they are discovered instead of waiting for the full
         discovery cycle to finish.
         """
+        from . import chromecast_client, dial_client
+
         seen_screen_ids = set()
         async for device in merge_iterators(
             [
