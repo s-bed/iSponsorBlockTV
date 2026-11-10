@@ -81,7 +81,8 @@ class PlaybackScheduler:
         try:
             if self._channel_blocked is None:
                 channel_id = await self._api_helper.get_channel_id(state.videoId)
-                self._channel_blocked = channel_id in self._blocked_channels
+                if channel_id is not None:
+                    self._channel_blocked = channel_id in self._blocked_channels
             if self._channel_blocked:
                 await self._dismiss_video(state, blocked_channel=True)
             elif state.currentTime is not None:

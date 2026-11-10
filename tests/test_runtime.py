@@ -4,12 +4,12 @@ import asyncio
 import logging
 from datetime import UTC
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 import pyytlounge
 from aiohttp import ClientError
-from custom_components.isponsorblocktv.core import ytlounge
+from custom_components.isponsorblocktv.core import api_helpers, ytlounge
 from custom_components.isponsorblocktv.core.pairing import (
     PairedScreen,
     PairingRejected,
@@ -248,14 +248,20 @@ async def test_channel_dismissal_rechecks_playback_after_waiting_for_command_loc
     command.assert_not_awaited()
 
 
-async def test_channel_lookup_failure_falls_through_to_sponsorblock(hass):
+async def test_channel_lookup_retries_after_failure_while_sponsorblock_continues(hass):
     tv = _playback_runtime(
         hass, blocked_channels=frozenset({BLOCKED_CHANNEL}), skip_categories=["sponsor"]
     )
     client = tv._client
     segment = {"start": 0, "end": 12, "UUID": ["segment"]}
-    session = SimpleNamespace(get=Mock(side_effect=TimeoutError))
+    request = AsyncMock()
+    request.__aenter__.return_value = SimpleNamespace(
+        status=200,
+        json=AsyncMock(return_value={"items": [{"snippet": {"channelId": BLOCKED_CHANNEL}}]}),
+    )
+    session = SimpleNamespace(get=Mock(side_effect=[TimeoutError, request]))
     with (
+        patch.object(api_helpers, "monotonic", return_value=100) as lookup_time,
         patch.object(client.api_helper, "web_session", session),
         patch.object(
             client.api_helper, "get_segments", new_callable=AsyncMock, return_value=[segment]
@@ -268,12 +274,25 @@ async def test_channel_lookup_failure_falls_through_to_sponsorblock(hass):
                 "nowPlaying", [{"videoId": "video", "state": "1", "currentTime": "0"}]
             )
             await asyncio.gather(*tv._scheduler._tasks)
+            command.assert_awaited_once_with("seekTo", {"newTime": 12})
+
+            lookup_time.return_value = 101
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "12"}])
+            await asyncio.gather(*tv._scheduler._tasks)
+            session.get.assert_called_once()
+
+            lookup_time.return_value = 100 + api_helpers._CHANNEL_MISS_TTL + 1
+            await client._process_event("onStateChange", [{"state": "1", "currentTime": "13"}])
+            await asyncio.gather(*tv._scheduler._tasks)
         finally:
             await tv._scheduler.cancel()
 
-    session.get.assert_called_once()
-    segments.assert_awaited_once_with("video")
-    command.assert_awaited_once_with("seekTo", {"newTime": 12})
+    assert session.get.call_count == 2
+    assert segments.await_args_list == [call("video"), call("video")]
+    assert command.await_args_list == [
+        call("seekTo", {"newTime": 12}),
+        call("dpadCommand", {"key": "BACK"}),
+    ]
     mark_viewed.assert_awaited_once_with(["segment"])
     assert tv.snapshot.skip_count == 1
 
