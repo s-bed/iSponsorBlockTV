@@ -7,7 +7,7 @@ from pyytlounge.models import State
 
 
 class PlaybackScheduler:
-    """Schedule SponsorBlock seeks and short-video dismissal for one screen."""
+    """Schedule SponsorBlock seeks and video dismissal for one screen."""
 
     def __init__(
         self,
@@ -19,6 +19,7 @@ class PlaybackScheduler:
         on_skip=None,
         on_short_disruption=None,
         short_video_duration_threshold: float | None = None,
+        blocked_channels: frozenset[str] = frozenset(),
     ):
         self._api_helper = api_helper
         self._client = client
@@ -27,11 +28,14 @@ class PlaybackScheduler:
         self._on_skip = on_skip
         self._on_short_disruption = on_short_disruption
         self._short_video_duration_threshold = short_video_duration_threshold
+        self._blocked_channels = blocked_channels
         self._pending = None
         self._tasks = set()
         self._seeking = False
         self._last_skip = None
         self._disturbed_video = None
+        self._channel_video = ""
+        self._channel_blocked: bool | None = None
 
     async def __call__(self, state):
         if self._pending is not None:
@@ -45,6 +49,11 @@ class PlaybackScheduler:
                 self._last_skip = None
         if state.state in (State.Stopped, State.Buffering):
             self._disturbed_video = None
+        if state.state in (State.Stopped, State.Buffering) or (
+            state.videoId and state.videoId != self._channel_video
+        ):
+            self._channel_video = state.videoId
+            self._channel_blocked = None
         if state.state != State.Playing or not state.videoId:
             return
         if state.videoId != self._disturbed_video:
@@ -55,6 +64,10 @@ class PlaybackScheduler:
             if self._disturbed_video == state.videoId:
                 return
             work = self._dismiss_video(state)
+        elif self._blocked_channels and self._channel_blocked is not False:
+            if self._disturbed_video == state.videoId:
+                return
+            work = self._check_channel(state, monotonic())
         elif state.currentTime is not None:
             work = self._schedule(state.videoId, state.currentTime, monotonic())
         else:
@@ -64,19 +77,44 @@ class PlaybackScheduler:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def _check_channel(self, state, sampled_at):
+        try:
+            if self._channel_blocked is None:
+                channel_id = await self._api_helper.get_channel_id(state.videoId)
+                if channel_id is not None:
+                    self._channel_blocked = channel_id in self._blocked_channels
+            if self._channel_blocked:
+                await self._dismiss_video(state, blocked_channel=True)
+            elif state.currentTime is not None:
+                await self._schedule(state.videoId, state.currentTime, sampled_at)
+        finally:
+            if self._pending is asyncio.current_task():
+                self._pending = None
+
     async def dismiss_after_reconnect(self):
         """Dismiss the Shorts attempt on a newly restored connection."""
         await self._dismiss_video(self._client.playback_state, after_reconnect=True)
 
-    async def _dismiss_video(self, state, *, after_reconnect=False):
+    async def _dismiss_video(self, state, *, after_reconnect=False, blocked_channel=False):
         def before_send() -> bool:
             # Playback updates cancel pending work while it waits for the command lock.
             if not self._client.connected() or (self._client.ad_playing and not after_reconnect):
                 return False
+            if blocked_channel:
+                current = self._client.playback_state
+                if (
+                    current is None
+                    or current.state != State.Playing
+                    or current.videoId != state.videoId
+                    or self._disturbed_video == state.videoId
+                ):
+                    return False
             self._pending = None
             self._disturbed_video = state.videoId if state else None
             if after_reconnect:
                 self._logger.debug("Sending Back after reconnecting from a screen disconnect")
+            elif blocked_channel:
+                self._logger.debug("Dismissing video from a blocked YouTube channel with Back")
             else:
                 self._logger.debug(
                     "Dismissing short video (duration %.3f s, threshold %.3f s) with Back",
@@ -87,10 +125,11 @@ class PlaybackScheduler:
 
         try:
             dismissed = await self._client.press_back(only_if=before_send)
-            if dismissed and self._on_short_disruption is not None:
+            if dismissed and not blocked_channel and self._on_short_disruption is not None:
                 self._on_short_disruption()
         except Exception as err:  # noqa: BLE001
-            self._logger.debug("Short video dismissal failed (%s)", type(err).__name__)
+            reason = "Channel blocklist" if blocked_channel else "Short video"
+            self._logger.debug("%s dismissal failed (%s)", reason, type(err).__name__)
         finally:
             if self._pending is asyncio.current_task():
                 self._pending = None
@@ -150,3 +189,5 @@ class PlaybackScheduler:
         if reset:
             self._last_skip = None
             self._disturbed_video = None
+            self._channel_video = ""
+            self._channel_blocked = None

@@ -52,6 +52,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         web_session: ClientSession | None = None,
         standalone=True,
         on_update=None,
+        request_initial_playback: bool = False,
     ):
         self.logger = logger or _LOGGER
         super().__init__(
@@ -61,6 +62,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.session = web_session
         self._standalone = standalone
         self._on_update = on_update
+        self._request_initial_playback = request_initial_playback
         self.auth.screen_id = screen_id
         self.auth.lounge_id_token = None
         # Unique device_id for iSponsorBlockTV, allows other clients to connect simultaneously
@@ -185,7 +187,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         watchdog = self._watchdog_task = asyncio.create_task(
             self._watchdog(asyncio.get_running_loop().time())
         )
-        if resume:
+        if resume or (
+            self._request_initial_playback
+            and (self.playback_state is None or not self.playback_state.videoId)
+        ):
             self._start_action(self.get_now_playing)
         self.logger.debug("Listening for YouTube Lounge events")
         try:
