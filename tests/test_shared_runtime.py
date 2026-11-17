@@ -142,7 +142,7 @@ async def test_subscription_cancellation_releases_tasks_without_closing_session(
             keepalive_stopped.set()
 
     monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
-    monkeypatch.setattr(pyytlounge.YtLoungeApi, "_command", send_command)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", send_command)
     session = async_get_clientsession(hass)
     client = YtLoungeApi(web_session=session)
     if keepalive:
@@ -180,7 +180,7 @@ async def test_subscription_queries_playback_after_a_minute_without_commands(mon
     monkeypatch.setattr(loop, "time", lambda: real_time() + elapsed)
     monkeypatch.setattr(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0)
     monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
-    monkeypatch.setattr(pyytlounge.YtLoungeApi, "_command", send_command)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", send_command)
     caplog.set_level(logging.DEBUG, logger=client.logger.name)
 
     task = asyncio.create_task(client.run_subscription(AsyncMock()))
@@ -212,7 +212,7 @@ async def test_queued_keepalive_is_skipped_after_a_recent_command(monkeypatch):
     client = YtLoungeApi()
     client._sid = client._gsession = "connected"
     command = AsyncMock(return_value=True)
-    monkeypatch.setattr(pyytlounge.YtLoungeApi, "_command", command)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", command)
 
     async with client._command_mutex:
         volume = asyncio.create_task(client.set_volume(42))

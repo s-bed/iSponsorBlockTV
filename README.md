@@ -63,6 +63,12 @@ of Home Assistant Recorder. Totals start at zero when upgrading from the
 session-only counter. Additional video and audio sensors can be enabled from the
 device page.
 
+With **Skip YouTube ads when possible** enabled, the integration skips ads as
+soon as YouTube allows it. For an explicitly non-skippable ad, it pauses the ad,
+shows a five-second countdown toast, and reloads the content at its saved
+position. It corrects the position once playback resumes if needed. YouTube
+controls how the toast appears on the TV.
+
 Each TV has an **Interrupt short videos** switch in the **Configuration**
 section of its Home Assistant device page. It is on by default. Turn it off to
 stop Shorts interruptions on that TV without reconnecting. The switch and the
@@ -73,6 +79,10 @@ iSponsorBlockTV sends a Back command to dismiss videos shorter than the
 configured threshold (30 seconds by default). This also applies to regular
 videos under the threshold. Videos at or above the threshold and ads are
 excluded.
+
+A sudden duration drop below half of the known content duration for the same
+video is treated as an ad transition. This prevents short ad durations from
+triggering the Shorts rule before YouTube reports that an ad is playing.
 
 YouTube can show the Shorts connection warning before it reports a video's
 duration. With **Interrupt short videos** on, iSponsorBlockTV sends Back once
@@ -122,6 +132,10 @@ request was accepted. The following playback events show what the TV did.
 For a disconnect, look for `Sending YouTube Lounge keepalive` and the following
 `getNowPlaying` acknowledgment. The integration sends this request after about
 a minute without a Lounge command while the TV is connected.
+
+For the five-second ad workaround, look for `Pausing non-skippable YouTube ad`
+and `Reloaded content after non-skippable YouTube ad`. The pause entry includes
+the saved content position and remaining countdown.
 
 For a Shorts interruption, find `YouTube Shorts Back result` near the **Last
 YouTube Shorts disruption** timestamp. The trigger shows which rule sent Back.

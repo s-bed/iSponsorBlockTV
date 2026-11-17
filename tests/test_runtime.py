@@ -81,7 +81,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(
     if duration is not None:
         sample["duration"] = duration
 
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             await client._process_event("nowPlaying", [sample])
             await asyncio.gather(*tv._scheduler._tasks)
@@ -115,7 +115,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(
 async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
     tv = _playback_runtime(hass)
     client = tv._client
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             await client._process_event(
                 "nowPlaying",
@@ -132,11 +132,68 @@ async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
     assert tv.snapshot.last_short_disruption is None
 
 
+@pytest.mark.parametrize("first_event", ["onStateChange", "nowPlaying"])
+async def test_midroll_duration_from_debug_log_does_not_dismiss_content(hass, first_event):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
+        try:
+            await client._process_event(
+                "nowPlaying",
+                [
+                    {
+                        "videoId": "long-video",
+                        "state": "1",
+                        "currentTime": "358.901",
+                        "duration": "1364.521",
+                    }
+                ],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            ad_update = {"state": "1", "currentTime": "0", "duration": "14"}
+            if first_event == "nowPlaying":
+                ad_update["videoId"] = "long-video"
+            await client._process_event(first_event, [ad_update])
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "long-video", "state": "1", "currentTime": "0", "duration": "14.301"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            command.assert_not_awaited()
+            assert client.ad_playing is True
+            assert tv.snapshot.last_short_disruption is None
+
+            await client._process_event(
+                "nowPlaying",
+                [
+                    {
+                        "videoId": "long-video",
+                        "state": "1",
+                        "currentTime": "385",
+                        "duration": "1364.521",
+                    }
+                ],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            assert client.ad_playing is False
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "actual-short", "state": "1", "currentTime": "0", "duration": "14"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+            assert tv.snapshot.last_short_disruption is not None
+        finally:
+            await tv._scheduler.cancel()
+            await client.stop_subscription()
+
+
 @pytest.mark.parametrize("change", ["different video", "switch off"])
 async def test_queued_short_dismissal_rechecks_playback_or_switch_state(hass, change):
     tv = _playback_runtime(hass)
     client = tv._client
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             async with client._command_mutex:
                 await client._process_event(
@@ -206,7 +263,7 @@ async def test_blocked_channel_dismisses_once_without_sponsorblock_or_duration(h
             new_callable=AsyncMock,
             return_value=BLOCKED_CHANNEL,
         ) as lookup,
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             await client._process_event("nowPlaying", [{"videoId": "video", "state": "1"}])
@@ -241,7 +298,7 @@ async def test_channel_dismissal_rechecks_playback_after_waiting_for_command_loc
             return_value=BLOCKED_CHANNEL,
         ),
         patch.object(client, "press_back", side_effect=observe_back),
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             async with client._command_mutex:
@@ -281,7 +338,7 @@ async def test_channel_lookup_retries_after_failure_while_sponsorblock_continues
             client.api_helper, "get_segments", new_callable=AsyncMock, return_value=[segment]
         ) as segments,
         patch.object(client.api_helper, "mark_viewed_segments") as mark_viewed,
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             await client._process_event(
@@ -337,8 +394,8 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
     )
 
     with patch.object(
-        pyytlounge.YtLoungeApi,
-        "_command",
+        runtime.YtLoungeApi,
+        "_send_command",
         side_effect=[True, ClientError("https://example.com/?token=private-lounge-token")],
     ) as command:
         await client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
@@ -454,7 +511,7 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
         patch.object(client, "connect", side_effect=connect),
         patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
         patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
-        patch.object(pyytlounge.YtLoungeApi, "_command", side_effect=send_command) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", side_effect=send_command) as command,
     ):
         tv.async_start()
         try:
@@ -559,7 +616,7 @@ async def test_disconnect_without_reason_retries_immediately_once_without_back(h
         patch.object(client, "is_available", return_value=True),
         patch.object(client, "connect", side_effect=connect) as bind,
         patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
-        patch.object(pyytlounge.YtLoungeApi, "_command") as command,
+        patch.object(runtime.YtLoungeApi, "_send_command") as command,
         patch.object(tv._logger, "debug", side_effect=record_retry),
     ):
         tv.async_start()

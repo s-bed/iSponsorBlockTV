@@ -14,6 +14,7 @@ from pyytlounge.models import DpadCommand, State
 from pyytlounge.wrapper import NotLinkedException, api_base, as_aiter
 
 from .constants import youtube_client_blacklist
+from .ad_replay import AdReplay
 
 _LOGGER = logging.getLogger(__name__)
 _WIRE_LOGGER = logging.getLogger(f"{__name__}.wire")
@@ -86,6 +87,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._last_command_at: float | None = None
         self._command_mutex = asyncio.Lock()
         self._ad_mutex = asyncio.Lock()
+        self._command_message_offset = 1
+        self._ad_replay = AdReplay(self, getattr(config, "offset", 0) / 1000)
 
     @property
     def disturb_short_videos(self) -> bool:
@@ -127,6 +130,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._connection_lost()
         self.screen_disconnected_without_reason = False
         self._last_command_at = None
+        self._ad_replay.reset()
         self.reset_playback()
 
     def _notify_update(self):
@@ -142,14 +146,29 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             state = State(state_code)
         except TypeError, ValueError, OverflowError:
             state = State.Stopped
-        if state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
-            self._set_ad(False, source=event_type)
-        elif state is State.Advertisement and not self.ad_playing:
-            self._set_ad(True, source=event_type)
         video_id = data.get("videoId", "" if event_type == "nowPlaying" else previous.videoId)
+        if isinstance(video_id, str) and video_id and video_id != self._ad_replay.video_id:
+            self._ad_replay.video_changed(video_id)
+            self._set_ad(False, source=event_type)
+        reported_duration = _nonnegative_float(data.get("duration"))
+        inferred_ad = self._ad_replay.looks_like_ad(video_id, reported_duration)
+        explicit_ad = bool(data.get("adVideoId")) or data.get("adState") in ("1", 1)
+        continuing_ad = (
+            self.ad_playing
+            and state is not State.AdSkipped
+            and self._ad_replay.duration is not None
+            and (reported_duration is None or reported_duration <= 0)
+            and bool(video_id or event_type == "onStateChange")
+        )
+        if state is State.AdSkipped:
+            self._set_ad(False, source=event_type)
+        elif inferred_ad or explicit_ad or continuing_ad or state is State.Advertisement:
+            state = State.Advertisement
+            self._set_ad(True, self.ad_skippable or False, source=event_type)
+        elif state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
+            self._set_ad(False, source=event_type)
         if not isinstance(video_id, str) or state in (State.Stopped, State.Buffering):
             video_id = ""
-        reported_duration = _nonnegative_float(data.get("duration"))
         duration = reported_duration
         # Lounge can report an ad's duration with the content's video ID.
         ad_states = (State.Advertisement, State.AdSkipped)
@@ -165,6 +184,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             duration=duration if video_id else None,
             videoId=video_id,
             state=state,
+        )
+        self._ad_replay.observe(
+            self.playback_state,
+            clear_content=event_type == "nowPlaying" and not self.playback_state.videoId,
         )
         self.logger.debug(
             "YouTube %s: playback %s -> %s (state code=%s, position=%s s, duration=%s s, "
@@ -243,6 +266,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     async def stop_subscription(self):
         """Cancel and wait for subscription and event-triggered work."""
         self._state_callback = None
+        self._ad_replay.cancel()
         tasks = set(self._actions)
         tasks.update(task for task in (self._subscription, self._watchdog_task) if task)
         self._subscription = self._watchdog_task = None
@@ -269,12 +293,29 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 if self._muted_for_ad and await self.mute(False, override=True):
                     self._muted_for_ad = False
             elif self.skip_ads and self.ad_skippable:
-                if (
-                    await self.skip_ad()
-                    and self._muted_for_ad
-                    and await self.mute(False, override=True)
-                ):
-                    self._muted_for_ad = False
+                try:
+                    if self._muted_for_ad:
+                        skipped = await self._commands(
+                            [
+                                ("skipAd", None),
+                                (
+                                    "setVolume",
+                                    {
+                                        "volume": self.volume_state.get("volume", 100),
+                                        "muted": "false",
+                                    },
+                                ),
+                            ]
+                        )
+                        if skipped:
+                            self._muted_for_ad = False
+                    else:
+                        skipped = await self.skip_ad()
+                except Exception:
+                    await self._ad_replay.resume_paused_ad()
+                    raise
+                if not skipped:
+                    await self._ad_replay.resume_paused_ad()
             elif self.mute_ads and self.muted is not True and not self._muted_for_ad:
                 # A disconnect may cancel the response after the command has reached the TV.
                 self._muted_for_ad = True
@@ -282,6 +323,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                     self._muted_for_ad = False
 
     def _set_ad(self, playing, skippable=False, *, source):
+        if playing and not self.ad_playing:
+            self._ad_replay.ad_started()
+        elif not playing and self.ad_playing:
+            self._ad_replay.ad_ended()
         if (playing, skippable) != (self.ad_playing, self.ad_skippable):
             self.logger.debug(
                 "YouTube %s: interpreted ad state (playing=%s, skippable=%s)",
@@ -291,7 +336,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             )
         self.ad_playing = playing
         self.ad_skippable = skippable
-        if self._muted_for_ad or (playing and (self.mute_ads or self.skip_ads)):
+        if playing and skippable:
+            self._ad_replay.cancel(keep_paused=True)
+        if (self._muted_for_ad and not self._ad_replay.restoring_content) or (
+            playing and (self.mute_ads or self.skip_ads)
+        ):
             self._start_action(self._apply_ad_behavior)
 
     # Process a lounge subscription event
@@ -327,6 +376,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             if self.api_helper and (video_id := data.get("contentVideoId")):
                 self._start_action(self.api_helper.get_segments, video_id)
             self._set_ad(True, data.get("isSkipEnabled") in ("true", True), source=event_type)
+            if (
+                self.skip_ads
+                and data.get("isSkippable") in ("false", False)
+                and not self.ad_skippable
+            ):
+                if isinstance(video_id := data.get("contentVideoId"), str) and video_id:
+                    self._ad_replay.video_changed(video_id)
+                self._ad_replay.start(_nonnegative_float(data.get("currentTime")) or 0)
         elif event_type == "loungeStatus":
             devices = json.loads(data["devices"])
             for device in devices:
@@ -428,12 +485,51 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                     return False
                 self._last_command_at = asyncio.get_running_loop().time()
                 self.logger.debug("Sending YouTube Lounge command %s", command)
-                acknowledged = await super()._command(command, command_parameters)
+                acknowledged = await self._send_command(command, command_parameters)
         except (Exception, asyncio.CancelledError) as err:
             self.logger.debug("YouTube Lounge command %s ended (%s)", command, type(err).__name__)
             raise
         self.logger.debug("YouTube Lounge command %s acknowledged=%s", command, acknowledged)
         return acknowledged
+
+    async def _send_command(self, command: str, parameters: dict | None) -> bool:
+        """Send one command through the same message counters as command batches."""
+        return await self._send_commands([(command, parameters)])
+
+    async def _commands(self, commands: list[tuple[str, dict | None]], *, only_if=None) -> bool:
+        """Send an ordered batch while holding the regular command lock."""
+        async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
+            if only_if is not None and not only_if():
+                return False
+            self._last_command_at = asyncio.get_running_loop().time()
+            self.logger.debug(
+                "Sending YouTube Lounge command batch %s", [command for command, _ in commands]
+            )
+            acknowledged = await self._send_commands(commands)
+        self.logger.debug("YouTube Lounge command batch acknowledged=%s", acknowledged)
+        return acknowledged
+
+    async def _send_commands(self, commands: list[tuple[str, dict | None]]) -> bool:
+        if not commands:
+            raise ValueError("At least one Lounge command is required")
+        if not self.connected():
+            return False
+        body = {"count": len(commands), "ofs": self._command_message_offset}
+        for index, (command, parameters) in enumerate(commands):
+            body[f"req{index}__sc"] = command
+            for name, value in (parameters or {}).items():
+                body[f"req{index}_{name}"] = value
+        self._command_message_offset += len(commands)
+        self._command_offset += 1
+        params = {**self._common_connection_parameters(), "RID": self._command_offset}
+        async with self._required_session.post(
+            url=f"{api_base}/bc/bind", data=body, params=params
+        ) as response:
+            text = await response.text()
+            if not self._handle_session_result(response.status, text):
+                return False
+            response.raise_for_status()
+            return True
 
     def _handle_session_result(self, status_code: int, reason: str) -> bool:
         accepted = super()._handle_session_result(status_code, reason)
@@ -523,6 +619,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 async for events in self._parse_event_chunks(as_aiter(lines)):
                     await self._process_events(events)
                 self._command_offset = 1
+                self._command_message_offset = 1
                 return self.connected()
             except Exception:
                 self._logger.exception(
