@@ -21,6 +21,8 @@ _WIRE_LOGGER.addHandler(logging.NullHandler())
 _WIRE_LOGGER.propagate = False
 _REQUEST_TIMEOUT = 10
 _RECONNECT_BACK_WINDOW = 60
+_KEEPALIVE_IDLE_INTERVAL = 60
+_WATCHDOG_POLL_INTERVAL = 10
 
 
 @dataclass
@@ -81,6 +83,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.skip_ads = config.skip_ads if config else False
         self._muted_for_ad = False
         self.last_event_time: float | None = None
+        self._last_command_at: float | None = None
         self._command_mutex = asyncio.Lock()
         self._ad_mutex = asyncio.Lock()
 
@@ -123,6 +126,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         """Discard the local session and playback state."""
         self._connection_lost()
         self.screen_disconnected_without_reason = False
+        self._last_command_at = None
         self.reset_playback()
 
     def _notify_update(self):
@@ -183,11 +187,25 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             await self._state_callback(self.playback_state)
 
     async def _watchdog(self, started_at: float):
-        """Finish a subscription that has stopped receiving events."""
+        """Watch the event stream and refresh idle Lounge sessions."""
         loop = asyncio.get_running_loop()
-        while loop.time() - (self.last_event_time or started_at) <= 60:
-            await asyncio.sleep(10)
+        while (now := loop.time()) - (self.last_event_time or started_at) <= 60:
+            last_command_at = self._last_command_at or started_at
+            if self.connected() and now - last_command_at >= _KEEPALIVE_IDLE_INTERVAL:
+                self._start_action(self._send_keepalive, started_at)
+            await asyncio.sleep(_WATCHDOG_POLL_INTERVAL)
         self.logger.debug("YouTube Lounge subscription stopped receiving events")
+
+    async def _send_keepalive(self, started_at: float) -> None:
+        def still_idle() -> bool:
+            last_command_at = self._last_command_at or started_at
+            idle = asyncio.get_running_loop().time() - last_command_at
+            if not self.connected() or idle < _KEEPALIVE_IDLE_INTERVAL:
+                return False
+            self.logger.debug("Sending YouTube Lounge keepalive (getNowPlaying, idle=%.1f s)", idle)
+            return True
+
+        await self.get_now_playing(only_if=still_idle)
 
     async def run_subscription(self, callback, *, resume: bool = False) -> bool:
         """Run the event stream and report whether it received events."""
@@ -371,8 +389,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             )
         return True
 
-    async def get_now_playing(self):
-        return await self._command("getNowPlaying")
+    async def get_now_playing(self, *, only_if: Callable[[], bool] | None = None) -> bool:
+        return await self._command("getNowPlaying", only_if=only_if)
 
     def take_reconnect_back(self) -> bool:
         """Consume a recent screen disconnect after a successful connection."""
@@ -408,6 +426,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
                 if only_if is not None and not only_if():
                     return False
+                self._last_command_at = asyncio.get_running_loop().time()
                 self.logger.debug("Sending YouTube Lounge command %s", command)
                 acknowledged = await super()._command(command, command_parameters)
         except (Exception, asyncio.CancelledError) as err:

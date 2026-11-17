@@ -119,6 +119,10 @@ The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
 request and whether YouTube acknowledged it. An acknowledgment confirms the
 request was accepted. The following playback events show what the TV did.
 
+For a disconnect, look for `Sending YouTube Lounge keepalive` and the following
+`getNowPlaying` acknowledgment. The integration sends this request after about
+a minute without a Lounge command while the TV is connected.
+
 For a Shorts interruption, find `YouTube Shorts Back result` near the **Last
 YouTube Shorts disruption** timestamp. The trigger shows which rule sent Back.
 For the duration rule, the nearby playback event shows what duration YouTube
