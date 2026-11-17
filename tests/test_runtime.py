@@ -534,6 +534,45 @@ async def test_temporary_failure_and_offline_tv_do_not_start_repair(hass):
     assert not list(entry.async_get_active_flows(hass, {SOURCE_REAUTH}))
 
 
+async def test_disconnect_without_reason_retries_immediately_once_without_back(hass):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    backing_off = asyncio.Event()
+
+    async def connect():
+        client._sid = client._gsession = "connected"
+        return True
+
+    async def subscribe():
+        await client._process_event("loungeScreenDisconnected", [])
+
+    def record_retry(message, *args):
+        if message == "Retrying YouTube Lounge connection in %s s":
+            backing_off.set()
+
+    with (
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect) as bind,
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "_command") as command,
+        patch.object(tv._logger, "debug", side_effect=record_retry),
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(backing_off.wait(), timeout=2)
+        finally:
+            await tv.async_stop()
+
+    assert bind.await_count == 2
+    command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
+
+
 @pytest.mark.parametrize(
     ("stream_ends", "invalid_session"),
     [(1, False), (1, True), (3, False)],

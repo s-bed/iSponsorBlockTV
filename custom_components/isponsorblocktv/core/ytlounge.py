@@ -73,6 +73,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._actions = set()
         self._state_callback = None
         self.playback_state = None
+        self.screen_disconnected_without_reason = False
         self._shorts_disconnected_at: float | None = None
         self._disturb_short_videos = getattr(config, "disturb_short_videos", False)
         self.auto_play = config.auto_play if config else True
@@ -121,6 +122,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     def reset_session(self) -> None:
         """Discard the local session and playback state."""
         self._connection_lost()
+        self.screen_disconnected_without_reason = False
         self.reset_playback()
 
     def _notify_update(self):
@@ -320,12 +322,14 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                         return
         elif event_type == "loungeScreenDisconnected":
             reason = data.get("reason")
+            reason = reason if isinstance(reason, str) else None
+            self.screen_disconnected_without_reason = reason is None
             if reason == "disconnectedByUserScreenInitiated" and self._disturb_short_videos:
                 self._shorts_disconnected_at = monotonic()
             self.logger.debug(
                 "YouTube loungeScreenDisconnected: reason=%r, Shorts workaround pending=%s, "
                 "reconnect Back enabled=%s",
-                reason if isinstance(reason, str) else None,
+                reason,
                 self._shorts_disconnected_at is not None,
                 self._disturb_short_videos,
             )
