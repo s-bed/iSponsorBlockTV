@@ -6,6 +6,7 @@ DOMAIN = "isponsorblocktv"
 GLOBAL_SETTINGS_ID = "global_channel_settings"
 CONF_SCREEN_ID = "screen_id"
 CONF_DIAL_UDN = "dial_udn"
+CONF_DISTURB_SHORT_VIDEOS = "disturb_short_videos"
 DIAL_SERVICE = "urn:dial-multiscreen-org:service:dial:1"
 
 DEFAULT_OPTIONS = {
@@ -14,7 +15,7 @@ DEFAULT_OPTIONS = {
     "offset": 0,
     "mute_ads": False,
     "skip_ads": False,
-    "disturb_short_videos": True,
+    CONF_DISTURB_SHORT_VIDEOS: True,
     "short_video_duration_threshold": 30,
     "auto_play": True,
     "skip_count_tracking": True,

@@ -60,7 +60,12 @@ class PlaybackScheduler:
             self._disturbed_video = None
 
         threshold = self._short_video_duration_threshold
-        if threshold is not None and state.duration is not None and 0 < state.duration < threshold:
+        if (
+            threshold is not None
+            and self._client.disturb_short_videos
+            and state.duration is not None
+            and 0 < state.duration < threshold
+        ):
             if self._disturbed_video == state.videoId:
                 return
             work = self._dismiss_video(state)
@@ -96,9 +101,22 @@ class PlaybackScheduler:
         await self._dismiss_video(self._client.playback_state, after_reconnect=True)
 
     async def _dismiss_video(self, state, *, after_reconnect=False, blocked_channel=False):
+        trigger = "screen disconnect" if after_reconnect else "duration threshold"
+
         def before_send() -> bool:
             # Playback updates cancel pending work while it waits for the command lock.
-            if not self._client.connected() or (self._client.ad_playing and not after_reconnect):
+            if not blocked_channel and not self._client.disturb_short_videos:
+                return False
+            connected = self._client.connected()
+            ad_playing = self._client.ad_playing
+            if not connected or (ad_playing and not after_reconnect):
+                if not blocked_channel:
+                    self._logger.debug(
+                        "YouTube Shorts Back skipped (trigger=%s, connected=%s, ad playing=%s)",
+                        trigger,
+                        connected,
+                        ad_playing,
+                    )
                 return False
             if blocked_channel:
                 current = self._client.playback_state
@@ -111,25 +129,35 @@ class PlaybackScheduler:
                     return False
             self._pending = None
             self._disturbed_video = state.videoId if state else None
-            if after_reconnect:
-                self._logger.debug("Sending Back after reconnecting from a screen disconnect")
-            elif blocked_channel:
+            if blocked_channel:
                 self._logger.debug("Dismissing video from a blocked YouTube channel with Back")
             else:
                 self._logger.debug(
-                    "Dismissing short video (duration %.3f s, threshold %.3f s) with Back",
-                    state.duration,
+                    "Sending YouTube Shorts Back (trigger=%s, playback=%s, has video=%s, "
+                    "position=%s s, duration=%s s, threshold=%s s, ad playing=%s)",
+                    trigger,
+                    state.state.name if state else None,
+                    bool(state and state.videoId),
+                    state.currentTime if state else None,
+                    state.duration if state else None,
                     self._short_video_duration_threshold,
+                    ad_playing,
                 )
             return True
 
         try:
             dismissed = await self._client.press_back(only_if=before_send)
-            if dismissed and not blocked_channel and self._on_short_disruption is not None:
-                self._on_short_disruption()
+            if not blocked_channel:
+                self._logger.debug(
+                    "YouTube Shorts Back result (trigger=%s, acknowledged=%s)", trigger, dismissed
+                )
+                if dismissed and self._on_short_disruption is not None:
+                    self._on_short_disruption()
         except Exception as err:  # noqa: BLE001
-            reason = "Channel blocklist" if blocked_channel else "Short video"
-            self._logger.debug("%s dismissal failed (%s)", reason, type(err).__name__)
+            reason = "channel blocklist" if blocked_channel else trigger
+            self._logger.debug(
+                "Video dismissal failed (trigger=%s, error=%s)", reason, type(err).__name__
+            )
         finally:
             if self._pending is asyncio.current_task():
                 self._pending = None

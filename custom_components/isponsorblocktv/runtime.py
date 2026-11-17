@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from pyytlounge.models import State
 
-from .const import CONF_SCREEN_ID, DOMAIN
+from .const import CONF_DISTURB_SHORT_VIDEOS, CONF_SCREEN_ID, DOMAIN
 from .core.api_helpers import ApiHelper
 from .core.pairing import PairingRejected, PairingUnavailable, async_verify_screen_id
 from .core.playback import PlaybackScheduler
@@ -128,12 +128,23 @@ class TVRuntime:
             on_skip=self._async_skipped,
             on_short_disruption=self._async_short_disrupted,
             blocked_channels=blocked_channels,
-            short_video_duration_threshold=(
-                options["short_video_duration_threshold"]
-                if options["disturb_short_videos"]
-                else None
-            ),
+            short_video_duration_threshold=options["short_video_duration_threshold"],
         )
+
+    @property
+    def disturb_short_videos(self) -> bool:
+        """Return whether the TV's Shorts interruption is enabled."""
+        return self._client.disturb_short_videos
+
+    @callback
+    def async_set_disturb_short_videos(self, enabled: bool) -> None:
+        """Save and apply this TV's Shorts preference without reconnecting."""
+        if enabled == self.disturb_short_videos:
+            return
+        self._hass.config_entries.async_update_entry(
+            self._entry, options=self._entry.options | {CONF_DISTURB_SHORT_VIDEOS: enabled}
+        )
+        self._client.disturb_short_videos = enabled
 
     async def async_restore_activity(self) -> None:
         """Load saved playback activity before exposing the sensors."""

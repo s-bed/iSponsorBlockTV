@@ -9,8 +9,20 @@ from unittest.mock import Mock, patch
 import pytest
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import PERCENTAGE, STATE_OFF, STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTime
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    PERCENTAGE,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    EntityCategory,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -169,7 +181,7 @@ async def test_packaged_entry_registers_device_and_entities(hass: HomeAssistant)
             entity.unique_id.removeprefix(f"{entry.entry_id}_"): entity
             for entity in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
         }
-        assert len(registered) == 13
+        assert len(registered) == 14
         assert all(entity.device_id == device.id for entity in registered.values())
         assert {key for key, entity in registered.items() if entity.disabled} == {
             "video_id",
@@ -184,11 +196,68 @@ async def test_packaged_entry_registers_device_and_entities(hass: HomeAssistant)
         assert hass.states.get(registered["ad_playing"].entity_id).state == STATE_UNAVAILABLE
         assert hass.states.get(registered["skip_count"].entity_id).state == "0"
         assert hass.states.get(registered["last_short_disruption"].entity_id).state == STATE_UNKNOWN
+        shorts_switch = registered["disturb_short_videos"]
+        assert shorts_switch.entity_category is EntityCategory.CONFIG
+        assert hass.states.get(shorts_switch.entity_id).state == STATE_ON
 
         assert await hass.config_entries.async_unload(entry.entry_id)
 
     assert entry.state is ConfigEntryState.NOT_LOADED
     assert hass.states.get(connection).state == STATE_UNAVAILABLE
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.asyncio
+async def test_shorts_switch_saves_each_tvs_preference_without_reloading(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Living Room",
+        data={CONF_SCREEN_ID: "living"},
+        options={"short_video_duration_threshold": 45},
+    )
+    other = MockConfigEntry(domain=DOMAIN, title="Bedroom", data={CONF_SCREEN_ID: "bedroom"})
+    entry.add_to_hass(hass)
+    other.add_to_hass(hass)
+
+    with patch.object(runtime.TVRuntime, "async_start"):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            SWITCH_DOMAIN, DOMAIN, f"{entry.entry_id}_disturb_short_videos"
+        )
+        other_id = registry.async_get_entity_id(
+            SWITCH_DOMAIN, DOMAIN, f"{other.entry_id}_disturb_short_videos"
+        )
+        assert hass.states.get(entity_id).state == STATE_ON
+        assert hass.states.get(other_id).state == STATE_ON
+
+        original_runtime = entry.runtime_data
+        await hass.services.async_call(
+            SWITCH_DOMAIN, SERVICE_TURN_OFF, {ATTR_ENTITY_ID: entity_id}, blocking=True
+        )
+        await hass.async_block_till_done()
+        assert entry.runtime_data is original_runtime
+        assert entry.options == {
+            "short_video_duration_threshold": 45,
+            "disturb_short_videos": False,
+        }
+        assert hass.states.get(entity_id).state == STATE_OFF
+        assert hass.states.get(other_id).state == STATE_ON
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_OFF
+
+        await hass.services.async_call(
+            SWITCH_DOMAIN, SERVICE_TURN_ON, {ATTR_ENTITY_ID: entity_id}, blocking=True
+        )
+        assert hass.states.get(entity_id).state == STATE_ON
+        assert entry.options["disturb_short_videos"] is True
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        assert await hass.config_entries.async_unload(other.entry_id)
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

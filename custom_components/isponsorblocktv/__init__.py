@@ -12,7 +12,7 @@ from .channel_settings import async_get_channel_settings
 from .const import DEFAULT_OPTIONS, DOMAIN, GLOBAL_SETTINGS_ID
 from .runtime import ISponsorBlockTVConfigEntry, TVRuntime, activity_store
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.SWITCH]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ISponsorBlockTVConfigEntry) -> bool:
