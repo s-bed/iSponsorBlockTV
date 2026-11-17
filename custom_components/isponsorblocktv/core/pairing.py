@@ -62,7 +62,7 @@ async def _async_post_pairing(
             if response.status != HTTPStatus.OK:
                 raise PairingUnavailable
             payload = await response.json(content_type=None)
-    except (ClientError, TimeoutError, ValueError):
+    except ClientError, TimeoutError, ValueError:
         raise PairingUnavailable from None
 
     if not isinstance(payload, dict) or "error" in payload:

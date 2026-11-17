@@ -9,33 +9,16 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = Path("custom_components/isponsorblocktv")
-SOURCE = ROOT / "src/iSponsorBlockTV"
-SHARED_MODULES = (
-    "api_helpers.py",
-    "conditional_ttl_cache.py",
-    "constants.py",
-    "pairing.py",
-    "playback.py",
-    "ytlounge.py",
-)
 
 
 def build(output: Path, *, version: str | None = None, hacs: bool = False) -> None:
-    """Bundle the component with its shared runtime, without the CLI."""
-    component_files = {
+    """Archive the component for HACS or manual installation."""
+    files = {
         path.relative_to(ROOT): path.read_bytes()
         for path in (ROOT / COMPONENT).rglob("*")
         if path.is_file() and path.suffix in {".py", ".json"}
     }
-    core_files = {
-        COMPONENT / "core" / module: (SOURCE / module).read_bytes() for module in SHARED_MODULES
-    }
-    files = {
-        **component_files,
-        **core_files,
-        COMPONENT / "core/__init__.py": b'"""Shared iSponsorBlockTV runtime."""\n',
-        COMPONENT / "LICENSE.md": (ROOT / "LICENSE.md").read_bytes(),
-    }
+    files[COMPONENT / "LICENSE.md"] = (ROOT / "LICENSE.md").read_bytes()
     if version is not None:
         manifest_path = COMPONENT / "manifest.json"
         manifest = json.loads(files[manifest_path])

@@ -3,12 +3,10 @@ import hashlib
 import json
 import logging
 import math
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
-from uuid import uuid4
 
 import pyytlounge
 from aiohttp import ClientSession
@@ -36,7 +34,7 @@ class PlaybackState:
 def _nonnegative_float(value) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError, OverflowError):
+    except TypeError, ValueError, OverflowError:
         return None
     return number if math.isfinite(number) and number >= 0 else None
 
@@ -50,17 +48,15 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         logger=None,
         *,
         web_session: ClientSession | None = None,
-        standalone=True,
         on_update=None,
         request_initial_playback: bool = False,
     ):
         self.logger = logger or _LOGGER
         super().__init__(
             config.join_name if config else "iSponsorBlockTV",
-            logger=self.logger if standalone else _WIRE_LOGGER,
+            logger=_WIRE_LOGGER,
         )
         self.session = web_session
-        self._standalone = standalone
         self._on_update = on_update
         self._request_initial_playback = request_initial_playback
         self.auth.screen_id = screen_id
@@ -101,7 +97,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     def volume(self) -> int | None:
         try:
             volume = int(self.volume_state.get("volume"))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return volume if 0 <= volume <= 100 else None
 
@@ -138,7 +134,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         try:
             state_code = int(data.get("state"))
             state = State(state_code)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             state = State.Stopped
         if state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
             self._set_ad(False, source=event_type)
@@ -322,25 +318,9 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                         )
                         self._connection_lost()
                         return
-        elif event_type == "onSubtitlesTrackChanged":
-            video_id = data.get("videoId")
-            pending = self._shorts_disconnected_at is not None
-            self.logger.debug(
-                "YouTube onSubtitlesTrackChanged: Shorts workaround pending=%s, has video=%s",
-                pending,
-                bool(video_id),
-            )
-            if pending and self._standalone and not self._disturb_short_videos:
-                self._shorts_disconnected_at = None
-                if video_id:
-                    self.logger.debug("Shorts workaround is requesting video playback")
-                    self._start_action(self.play_video, video_id)
-            telemetry_changed = False
         elif event_type == "loungeScreenDisconnected":
             reason = data.get("reason")
-            if reason == "disconnectedByUserScreenInitiated" and (
-                self._standalone or self._disturb_short_videos
-            ):
+            if reason == "disconnectedByUserScreenInitiated" and self._disturb_short_videos:
                 self._shorts_disconnected_at = monotonic()
             self.logger.debug(
                 "YouTube loungeScreenDisconnected: reason=%r, Shorts workaround pending=%s, "
@@ -364,10 +344,6 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         if telemetry_changed:
             self._notify_update()
 
-    # Set the volume to a specific value (0-100)
-    async def set_volume(self, volume: int) -> None:
-        await self._command("setVolume", {"volume": volume})
-
     async def mute(self, mute: bool, override: bool = False) -> bool:
         """
         Mute or unmute the device (if the device already
@@ -390,9 +366,6 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 {"volume": self.volume_state.get("volume", 100), "muted": mute_str},
             )
         return True
-
-    async def play_video(self, video_id: str) -> bool:
-        return await self._command("setPlaylist", {"videoId": video_id})
 
     async def get_now_playing(self):
         return await self._command("getNowPlaying")
@@ -517,11 +490,6 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 text = await resp.text()
                 self.logger.debug("YouTube Lounge connection response: HTTP %s", resp.status)
                 if resp.status == 401:
-                    if self._standalone and "Connection denied" in text:
-                        self._logger.warning(
-                            "Connection denied, attempting to circumvent the issue"
-                        )
-                        await self.connect_as_screen()
                     self._lounge_token_expired()
                     return False
 
@@ -534,48 +502,6 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 self._command_offset = 1
                 return self.connected()
             except Exception:
-                self._logger.exception(
-                    "Handle connect failed, status %s reason %s",
-                    resp.status,
-                    resp.reason,
-                )
-                raise
-
-    async def connect_as_screen(self) -> bool:
-        """Attempt to connect using the previously set tokens"""
-        if not self.linked():
-            raise NotLinkedException("Not linked")
-
-        connect_body = {
-            "id": str(uuid4()),
-            "mdx-version": "3",
-            "TYPE": "xmlhttp",
-            "theme": "cl",
-            "sessionSource": "MDX_SESSION_SOURCE_UNKNOWN",
-            "connectParams": '{"setStatesParams": "{"playbackSpeed":0}"}',
-            "sessionNonce": str(uuid4()),
-            "RID": "1",
-            "CVER": "1",
-            "capabilities": "que,dsdtr,atp,vsp",
-            "ui": "false",
-            "app": "ytios-phone-20.15.1",
-            "pairing_type": "manual",
-            "VER": "8",
-            "loungeIdToken": self.auth.lounge_id_token,
-            "device": "LOUNGE_SCREEN",
-            "name": self.device_name,
-        }
-        connect_url = f"{api_base}/bc/bind"
-        async with self.session.post(url=connect_url, data=connect_body) as resp:
-            try:
-                await resp.text()
-                self.logger.error(
-                    "Connected as screen: please force close the app on the device for iSponsorBlockTV to work properly"
-                )
-                self.logger.warning("Exiting in 5 seconds")
-                await asyncio.sleep(5)
-                sys.exit(0)
-            except:
                 self._logger.exception(
                     "Handle connect failed, status %s reason %s",
                     resp.status,

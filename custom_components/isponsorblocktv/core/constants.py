@@ -1,4 +1,5 @@
-userAgent = "iSponsorBlockTV/0.1"
+"""SponsorBlock and YouTube protocol constants."""
+
 SponsorBlock_service = "youtube"
 SponsorBlock_actiontype = "skip"
 
@@ -19,8 +20,3 @@ skip_categories = (
 )
 
 youtube_client_blacklist = ["TVHTML5_FOR_KIDS"]
-
-
-config_file_blacklist_keys = ["config_file", "data_dir"]
-
-github_wiki_base_url = "https://github.com/dmunozv04/iSponsorBlockTV/wiki"

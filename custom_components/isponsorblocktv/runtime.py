@@ -103,7 +103,6 @@ class TVRuntime:
             **{
                 **options,
                 "apikey": options.get("apikey", "") if channel_api_key is None else channel_api_key,
-                "devices": [entry.entry_id],
                 "channel_whitelist": [
                     {"id": channel_id} for channel_id in options["channel_whitelist"]
                 ],
@@ -116,7 +115,6 @@ class TVRuntime:
             self._api,
             self._logger,
             web_session=session,
-            standalone=False,
             on_update=self._async_lounge_updated,
             request_initial_playback=bool(blocked_channels),
         )

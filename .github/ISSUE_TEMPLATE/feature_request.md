@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Suggest an improvement to the Home Assistant integration
 title: ''
 labels: ''
 assignees: ''
@@ -19,4 +19,4 @@ A clear and concise description of any alternative solutions or features you've
 considered.
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Include any relevant Home Assistant settings, TV model, or screenshots.

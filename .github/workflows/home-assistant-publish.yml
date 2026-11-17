@@ -42,7 +42,7 @@ jobs:
         if: steps.version.outputs.version != ''
         run: |
           python -m pip install -r tests/requirements.txt
-          python -m pytest -p homeassistant --asyncio-mode=auto tests
+          python -m pytest
       - name: Build release archives
         if: steps.version.outputs.version != ''
         env:

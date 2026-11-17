@@ -14,10 +14,11 @@ def repo(tmp_path):
     git(tmp_path, "init", "-q", "--initial-branch=main")
     git(tmp_path, "config", "user.email", "ci@example.com")
     git(tmp_path, "config", "user.name", "CI Test")
-    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "2.11.0"\n')
-    git(tmp_path, "add", "pyproject.toml")
-    git(tmp_path, "commit", "-qm", "Initial standalone version")
-    git(tmp_path, "tag", "v2.11.0")
+    manifest = tmp_path / "custom_components/isponsorblocktv/manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"version": "2.12.0"}))
+    git(tmp_path, "add", str(manifest))
+    git(tmp_path, "commit", "-qm", "Add integration manifest")
     return tmp_path
 
 
@@ -35,6 +36,14 @@ def test_initial_versions_and_preview_reruns(repo):
 
     assert release_version(repo, preview=23) == "2.12.0-beta.23"
     assert release_version(repo, preview=24) == "2.13.0-beta.24"
+
+
+def test_first_release_sorts_above_legacy_tags(repo):
+    git(repo, "tag", "v2.11.0")
+    assert release_version(repo) == "2.12.0"
+
+    git(repo, "tag", "v2.12.1")
+    assert release_version(repo) == "2.13.0"
 
 
 @pytest.mark.parametrize(
@@ -77,6 +86,7 @@ def test_release_zip_stamps_version_and_bundles_runtime(tmp_path, hacs, prefix):
     with ZipFile(output) as archive:
         assert archive.testzip() is None
         assert {
+            f"{prefix}LICENSE.md",
             f"{prefix}__init__.py",
             f"{prefix}core/playback.py",
             f"{prefix}translations/en.json",
