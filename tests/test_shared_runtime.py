@@ -1,4 +1,4 @@
-"""Exercise the Lounge wrapper and segment scheduling in the installable ZIP."""
+"""Exercise the integration's Lounge client and segment scheduling."""
 
 import asyncio
 import logging
@@ -62,7 +62,7 @@ async def test_pending_skip_cancelled_when_playback_pauses():
 @pytest.mark.asyncio
 async def test_telemetry_reflects_lounge_events_and_disconnect_reset():
     notify = Mock()
-    client = YtLoungeApi(standalone=False, on_update=notify)
+    client = YtLoungeApi(on_update=notify)
     await client._process_event(
         "nowPlaying", [{"videoId": "test", "state": "1", "duration": "30", "currentTime": "2"}]
     )
@@ -86,7 +86,7 @@ async def test_telemetry_reflects_lounge_events_and_disconnect_reset():
 
 @pytest.mark.asyncio
 async def test_malformed_playback_numbers_and_ended_video():
-    client = YtLoungeApi(standalone=False)
+    client = YtLoungeApi()
     await client._process_event(
         "nowPlaying",
         [{"videoId": "test", "state": "1", "duration": "NaN", "currentTime": None}],
@@ -103,7 +103,7 @@ async def test_ad_mute_restored_on_disconnect_and_prefetch_still_runs(monkeypatc
     config = SimpleNamespace(join_name="Test", mute_ads=True, skip_ads=False, auto_play=True)
     helper = SimpleNamespace(get_segments=AsyncMock())
     monkeypatch.setattr(pyytlounge.YtLoungeApi, "disconnect", AsyncMock(return_value=True))
-    client = YtLoungeApi(config=config, api_helper=helper, standalone=False)
+    client = YtLoungeApi(config=config, api_helper=helper)
     client._sid = client._gsession = "connected"
     client.mute = AsyncMock(return_value=True)
 
@@ -130,7 +130,7 @@ async def test_subscription_cancellation_releases_tasks_without_closing_session(
 
     monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
     session = async_get_clientsession(hass)
-    client = YtLoungeApi(standalone=False, web_session=session)
+    client = YtLoungeApi(web_session=session)
     task = asyncio.create_task(client.run_subscription(AsyncMock()))
     await asyncio.wait_for(started.wait(), timeout=1)
     task.cancel()
@@ -142,18 +142,15 @@ async def test_subscription_cancellation_releases_tasks_without_closing_session(
 
 
 @pytest.mark.asyncio
-async def test_bind_denial_does_not_invoke_standalone_workaround():
+async def test_bind_denial_invalidates_session_token():
     response = SimpleNamespace(status=401, text=AsyncMock(return_value="Connection denied"))
     request = AsyncMock()
     request.__aenter__.return_value = response
     client = YtLoungeApi(
         "screen-id",
-        standalone=False,
         web_session=SimpleNamespace(post=Mock(return_value=request)),
     )
-    client.connect_as_screen = AsyncMock()
     client.auth.lounge_id_token = "session-token"
 
     assert not await client.connect()
     assert client.auth.lounge_id_token is None
-    client.connect_as_screen.assert_not_awaited()

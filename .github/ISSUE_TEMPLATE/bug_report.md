@@ -7,34 +7,33 @@ assignees: ''
 
 ---
 
-Before opening an issue make sure that there are no duplicates and that you are
-on the latest version.
+Before opening an issue, check for duplicates and update iSponsorBlockTV to the
+latest release.
+
 **Describe the bug**
-A clear and concise description of what the bug is.
+What went wrong?
 
-**To Reproduce**
-Steps to reproduce the behavior:
+**Steps to reproduce**
+Describe what you did in Home Assistant and in the YouTube app on your TV.
 
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+1. ...
+2. ...
 
 **Expected behavior**
-A clear and concise description of what you expected to happen.
+What did you expect to happen?
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Home Assistant**
 
-**iSponsorBlockTV server (please complete the following information):**
+- Home Assistant version
+- iSponsorBlockTV version
+- Integration installation method (Marketplace, HACS, or manual)
 
-- OS: [e.g. Docker on linux Arm64, windows]
-- Python version [e.g. 3.7] (no need to fill if running on docker
+**TV or streaming device**
 
-**Apple TV (please complete the following information):**
+- Brand and model
+- TV operating system and YouTube app version, if available
 
-- Device: [e.g. Apple TV 4]
-- OS: [e.g. tvOS 15.4]
-
-**Additional context**
-Add any other context about the problem here.
+**Logs and screenshots**
+Include relevant Home Assistant logs or screenshots. Remove personal information,
+API keys, TV codes, and screen IDs before posting. For playback and connection
+issues, follow the [debug logging steps](https://github.com/s-bed/iSponsorBlockTV#playback-troubleshooting).

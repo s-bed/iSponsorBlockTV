@@ -1,8 +1,8 @@
 """Choose the next Home Assistant release version from Git history."""
 
+import json
 import re
 import subprocess
-import tomllib
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -57,12 +57,18 @@ def release_version(repo: Path, *, preview: int | None = None) -> str | None:
         messages = git(repo, "log", "--format=%B%x00", f"{stable}..HEAD").split("\0")
         version = _bump(stable, messages)
     else:
-        # Start above the standalone versions that HACS may see in the same repository.
-        project = tomllib.loads(git(repo, "show", "HEAD:pyproject.toml"))["project"]["version"]
-        standalone = [tag[1:] for tag in tags if tag.startswith("v") and STABLE.fullmatch(tag[1:])]
-        version = _bump(
-            max([project, *standalone], key=_number), ["feat: Home Assistant integration"]
+        version = json.loads(
+            git(repo, "show", "HEAD:custom_components/isponsorblocktv/manifest.json")
+        )["version"]
+        # HACS may also see historical releases that used a v prefix.
+        legacy = max(
+            (tag[1:] for tag in tags if tag.startswith("v") and STABLE.fullmatch(tag[1:])),
+            key=_number,
+            default=None,
         )
+        if legacy and _number(legacy) >= _number(version):
+            major, minor, _ = _number(legacy)
+            version = f"{major}.{minor + 1}.0"
 
     return version if preview is None else f"{version}-beta.{preview}"
 
