@@ -3,6 +3,7 @@
 from .core.constants import SponsorBlock_api
 
 DOMAIN = "isponsorblocktv"
+GLOBAL_SETTINGS_ID = "global_channel_settings"
 CONF_SCREEN_ID = "screen_id"
 CONF_DIAL_UDN = "dial_udn"
 DIAL_SERVICE = "urn:dial-multiscreen-org:service:dial:1"
@@ -19,7 +20,8 @@ DEFAULT_OPTIONS = {
     "skip_count_tracking": True,
     "join_name": "iSponsorBlockTV",
     "sponsorblock_api_url": SponsorBlock_api,
-    "apikey": "",
     "channel_whitelist": [],
+    "override_channel_blocklist": False,
+    "channel_blocklist": [],
     "use_proxy": False,
 }

@@ -1,11 +1,14 @@
 """Pair YouTube TVs and configure their skipping behavior in Home Assistant."""
 
 import asyncio
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from math import isfinite
 from typing import Any
 
 import probatio
+from aiohttp import ClientSession
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -24,6 +27,7 @@ from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -31,7 +35,29 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 from yarl import URL
 
-from .const import CONF_DIAL_UDN, CONF_SCREEN_ID, DEFAULT_OPTIONS, DIAL_SERVICE, DOMAIN
+from .channel_lookup import (
+    ChannelApiKeyRejected,
+    ChannelLookupError,
+    ChannelSearchResult,
+    async_channel_titles,
+    async_search_channels,
+    async_validate_api_key,
+    is_channel_id,
+)
+from .channel_settings import (
+    ChannelSettingsSaveError,
+    async_get_channel_settings,
+    async_set_api_key,
+    async_update_global_blocklist,
+)
+from .const import (
+    CONF_DIAL_UDN,
+    CONF_SCREEN_ID,
+    DEFAULT_OPTIONS,
+    DIAL_SERVICE,
+    DOMAIN,
+    GLOBAL_SETTINGS_ID,
+)
 from .core.constants import skip_categories
 from .core.pairing import (
     PairedScreen,
@@ -59,7 +85,7 @@ def _screen_unique_id(screen_id: str) -> str:
 
 
 class ISponsorBlockTVConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Configure one YouTube TV per entry."""
+    """Configure YouTube TVs and the shared channel settings entry."""
 
     VERSION = 1
 
@@ -76,12 +102,25 @@ class ISponsorBlockTVConfigFlow(ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlowWithReload:
-        """Return the per-TV settings flow."""
+        """Return the options flow for a TV or the shared settings entry."""
         return ISponsorBlockTVOptionsFlow()
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Offer either type of manual pairing."""
-        return self.async_show_menu(step_id="user", menu_options=["tv_code", "existing_screen_id"])
+        """Offer manual pairing or restore a missing settings entry."""
+        menu = ["tv_code", "existing_screen_id"]
+        if GLOBAL_SETTINGS_ID not in self._async_current_ids():
+            menu.append("global_settings")
+        return self.async_show_menu(step_id="user", menu_options=menu)
+
+    async def async_step_global_settings(self, _user_input=None) -> ConfigFlowResult:
+        """Create the single integration-wide settings entry."""
+        await self.async_set_unique_id(GLOBAL_SETTINGS_ID)
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(title="Global channel settings", data={})
+
+    async def async_step_import(self, _user_input=None) -> ConfigFlowResult:
+        """Add the settings entry when an existing TV loads."""
+        return await self.async_step_global_settings()
 
     async def async_step_tv_code(
         self, user_input: dict[str, Any] | None = None
@@ -173,6 +212,8 @@ class ISponsorBlockTVConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Allow re-pairing from the integration entry."""
         self._repair_entry = self._get_reconfigure_entry()
+        if self._repair_entry.unique_id == GLOBAL_SETTINGS_ID:
+            return self.async_abort(reason="global_settings_use_configure")
         return await self.async_step_tv_code()
 
     @callback
@@ -371,14 +412,37 @@ def _sponsorblock_url(raw_url: str) -> str:
 
 
 class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
-    """Configure playback handling independently for each TV."""
+    """Edit shared channel settings or playback options for one TV."""
+
+    def __init__(self) -> None:
+        self._channel_matches: tuple[ChannelSearchResult, ...] = ()
+
+    @property
+    def _is_global(self) -> bool:
+        return self.config_entry.unique_id == GLOBAL_SETTINGS_ID
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        if self._is_global:
+            return await self.async_step_global_channels()
+        return await self.async_step_tv_settings()
+
+    async def async_step_tv_settings(self, _user_input=None) -> ConfigFlowResult:
+        return self.async_show_menu(
+            step_id="tv_settings", menu_options=["playback", "tv_blocklist"]
+        )
+
+    async def async_step_global_channels(self, _user_input=None) -> ConfigFlowResult:
+        return await self._async_show_blocklist_menu("global_channels", "global_api_key")
+
+    async def async_step_playback(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Edit this TV's settings."""
         options = DEFAULT_OPTIONS | self.config_entry.options
         errors = {}
         if user_input is not None:
             previous_threshold = options["short_video_duration_threshold"]
+            previous_whitelist = options["channel_whitelist"]
             options.update({key: value for key, value in user_input.items() if key != _ADVANCED})
             options.update(user_input.get(_ADVANCED, {}))
             if not isfinite(options["short_video_duration_threshold"]):
@@ -389,10 +453,13 @@ class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
                     channel.strip() for channel in options["channel_whitelist"] if channel.strip()
                 )
             )
-            options["apikey"] = options["apikey"].strip()
             options["join_name"] = options["join_name"].strip() or DEFAULT_OPTIONS["join_name"]
-            if options["channel_whitelist"] and not options["apikey"]:
-                errors["base"] = "api_key_required"
+            if options["channel_whitelist"] and options["channel_whitelist"] != previous_whitelist:
+                settings = await async_get_channel_settings(self.hass)
+                if not settings.key_conflict:
+                    options.pop("apikey", None)
+                if not settings.api_key:
+                    errors["base"] = "api_key_required"
             try:
                 options["sponsorblock_api_url"] = _sponsorblock_url(options["sponsorblock_api_url"])
             except ValueError:
@@ -401,8 +468,241 @@ class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
                 return self.async_create_entry(data=options)
 
         return self.async_show_form(
-            step_id="init", data_schema=self._schema(options), errors=errors
+            step_id="playback", data_schema=self._schema(options), errors=errors
         )
+
+    async def async_step_tv_blocklist_mode(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            options = dict(self.config_entry.options)
+            options["override_channel_blocklist"] = user_input["override_channel_blocklist"]
+            return self.async_create_entry(title="", data=options)
+
+        return self.async_show_form(
+            step_id="tv_blocklist_mode",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        "override_channel_blocklist",
+                        default=self.config_entry.options.get("override_channel_blocklist", False),
+                    ): BooleanSelector()
+                }
+            ),
+        )
+
+    async def async_step_global_api_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        settings = await async_get_channel_settings(self.hass)
+        errors = {"base": "legacy_api_key_conflict"} if settings.key_conflict else {}
+        if user_input is not None:
+            api_key = user_input.get("api_key", "").strip()
+            clear = user_input.get("clear_api_key", False)
+            if bool(api_key) == clear:
+                errors["base"] = "provide_key_or_clear"
+            else:
+                try:
+                    if api_key:
+                        with self._channel_session() as session:
+                            await async_validate_api_key(session, api_key)
+                    await async_set_api_key(self.hass, api_key)
+                except ChannelApiKeyRejected:
+                    errors["base"] = "api_key_rejected"
+                except ChannelLookupError:
+                    errors["base"] = "channel_lookup_failed"
+                except ChannelSettingsSaveError:
+                    errors["base"] = "channel_settings_save_failed"
+                else:
+                    return self.async_create_entry(title="", data=None)
+
+        return self.async_show_form(
+            step_id="global_api_key",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Optional("api_key"): _PASSWORD,
+                    probatio.Optional("clear_api_key", default=False): BooleanSelector(),
+                }
+            ),
+            description_placeholders={"key_status": "✓" if settings.api_key else "—"},
+            errors=errors,
+        )
+
+    async def async_step_tv_blocklist(self, _user_input=None) -> ConfigFlowResult:
+        return await self._async_show_blocklist_menu("tv_blocklist", "tv_blocklist_mode")
+
+    async def _async_show_blocklist_menu(
+        self, step_id: str, settings_step: str
+    ) -> ConfigFlowResult:
+        blocklist = await self._async_get_blocklist()
+        menu = [settings_step, "channel_search", "channel_add_id"]
+        if blocklist:
+            menu.append("channel_remove")
+        return self.async_show_menu(
+            step_id=step_id,
+            menu_options=menu,
+            description_placeholders={"count": str(len(blocklist))},
+        )
+
+    async def async_step_channel_search(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        settings = await async_get_channel_settings(self.hass)
+        errors = {}
+        query = user_input["query"].strip() if user_input is not None else ""
+        if not settings.api_key:
+            errors["base"] = "api_key_required_for_channel_search"
+        elif user_input is not None:
+            if not query:
+                errors["query"] = "channel_query_required"
+            else:
+                try:
+                    with self._channel_session() as session:
+                        self._channel_matches = await async_search_channels(
+                            session, settings.api_key, query
+                        )
+                except ChannelLookupError:
+                    errors["base"] = "channel_search_failed"
+                else:
+                    if self._channel_matches:
+                        return await self.async_step_channel_select()
+                    errors["query"] = "channel_not_found"
+
+        return self.async_show_form(
+            step_id="channel_search",
+            data_schema=probatio.Schema(
+                {probatio.Required("query", default=query): TextSelector()}
+            ),
+            errors=errors,
+        )
+
+    async def async_step_channel_select(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors = {}
+        if user_input is not None:
+            channel_ids = user_input["channel_ids"]
+            if not channel_ids:
+                errors["channel_ids"] = "select_channel_to_add"
+            else:
+                try:
+                    return await self._async_save_blocklist(add=channel_ids)
+                except ChannelSettingsSaveError:
+                    errors["base"] = "channel_settings_save_failed"
+
+        return self.async_show_form(
+            step_id="channel_select",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required("channel_ids"): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(value=match.channel_id, label=match.label)
+                                for match in self._channel_matches
+                            ],
+                            multiple=True,
+                            mode=SelectSelectorMode.LIST,
+                        )
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_channel_add_id(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors = {}
+        channel_id = user_input["channel_id"].strip() if user_input is not None else ""
+        if user_input is not None:
+            if not is_channel_id(channel_id):
+                errors["channel_id"] = "invalid_channel_id"
+            elif channel_id in await self._async_get_blocklist():
+                errors["channel_id"] = "channel_already_blocked"
+            else:
+                try:
+                    return await self._async_save_blocklist(add=(channel_id,))
+                except ChannelSettingsSaveError:
+                    errors["base"] = "channel_settings_save_failed"
+
+        return self.async_show_form(
+            step_id="channel_add_id",
+            data_schema=probatio.Schema(
+                {probatio.Required("channel_id", default=channel_id): TextSelector()}
+            ),
+            errors=errors,
+        )
+
+    async def async_step_channel_remove(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        blocklist = await self._async_get_blocklist()
+        errors = {}
+        if user_input is not None:
+            if not user_input["channel_ids"]:
+                errors["channel_ids"] = "select_channel_to_remove"
+            else:
+                try:
+                    return await self._async_save_blocklist(remove=user_input["channel_ids"])
+                except ChannelSettingsSaveError:
+                    errors["base"] = "channel_settings_save_failed"
+
+        titles = {}
+        if blocklist and (settings := await async_get_channel_settings(self.hass)).api_key:
+            with self._channel_session() as session:
+                titles = await async_channel_titles(session, settings.api_key, blocklist)
+        return self.async_show_form(
+            step_id="channel_remove",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required("channel_ids"): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(
+                                    value=channel_id,
+                                    label=f"{titles[channel_id]} ({channel_id})"
+                                    if channel_id in titles
+                                    else channel_id,
+                                )
+                                for channel_id in blocklist
+                            ],
+                            multiple=True,
+                        )
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    @contextmanager
+    def _channel_session(self) -> Iterator[ClientSession]:
+        if not self.config_entry.options.get("use_proxy"):
+            yield async_get_clientsession(self.hass)
+            return
+        session = async_create_clientsession(self.hass, auto_cleanup=False, trust_env=True)
+        try:
+            yield session
+        finally:
+            session.detach()
+
+    async def _async_get_blocklist(self) -> Collection[str]:
+        if self._is_global:
+            return (await async_get_channel_settings(self.hass)).blocklist
+        return self.config_entry.options.get("channel_blocklist", ())
+
+    async def _async_save_blocklist(
+        self, *, add: Collection[str] = (), remove: Collection[str] = ()
+    ) -> ConfigFlowResult:
+        if self._is_global:
+            await async_update_global_blocklist(self.hass, add=add, remove=remove)
+            return self.async_create_entry(title="", data=None)
+
+        options = dict(self.config_entry.options)
+        remaining = (
+            channel for channel in options.get("channel_blocklist", ()) if channel not in remove
+        )
+        options["channel_blocklist"] = list(dict.fromkeys((*remaining, *add)))
+        return self.async_create_entry(title="", data=options)
 
     @staticmethod
     def _schema(options: dict[str, Any]) -> probatio.Schema:
@@ -447,7 +747,6 @@ class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
                             probatio.Required(
                                 "sponsorblock_api_url", default=options["sponsorblock_api_url"]
                             ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
-                            probatio.Optional("apikey", default=options["apikey"]): _PASSWORD,
                             probatio.Optional(
                                 "channel_whitelist", default=options["channel_whitelist"]
                             ): TextSelector(TextSelectorConfig(multiple=True)),

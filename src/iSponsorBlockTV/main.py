@@ -109,6 +109,7 @@ async def main_async(config, debug, http_tracing):
             if not task.cancelling():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await api_helper.cancel_channel_lookups()
         await finish(devices, web_session, tcp_connector)
         print("Exited")
 

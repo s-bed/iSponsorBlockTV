@@ -83,6 +83,9 @@ class TVRuntime:
         entry: ISponsorBlockTVConfigEntry,
         session: ClientSession,
         options: dict[str, Any],
+        *,
+        blocked_channels: frozenset[str] = frozenset(),
+        channel_api_key: str | None = None,
     ) -> None:
         self._hass = hass
         self._entry = entry
@@ -99,29 +102,32 @@ class TVRuntime:
         config = SimpleNamespace(
             **{
                 **options,
+                "apikey": options.get("apikey", "") if channel_api_key is None else channel_api_key,
                 "devices": [entry.entry_id],
                 "channel_whitelist": [
                     {"id": channel_id} for channel_id in options["channel_whitelist"]
                 ],
             }
         )
-        api = ApiHelper(config, session)
+        self._api = ApiHelper(config, session)
         self._client = YtLoungeApi(
             self._screen_id,
             config,
-            api,
+            self._api,
             self._logger,
             web_session=session,
             standalone=False,
             on_update=self._async_lounge_updated,
+            request_initial_playback=bool(blocked_channels),
         )
         self._scheduler = PlaybackScheduler(
-            api,
+            self._api,
             self._client,
             options["offset"] / 1000,
             self._logger,
             on_skip=self._async_skipped,
             on_short_disruption=self._async_short_disrupted,
+            blocked_channels=blocked_channels,
             short_video_duration_threshold=(
                 options["short_video_duration_threshold"]
                 if options["disturb_short_videos"]
@@ -287,6 +293,7 @@ class TVRuntime:
         )
         await self._client.stop_subscription()
         await self._scheduler.cancel()
+        await self._api.cancel_channel_lookups()
         if terminate:
             try:
                 async with asyncio.timeout(DISCONNECT_TIMEOUT):
