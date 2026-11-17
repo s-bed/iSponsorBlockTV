@@ -47,15 +47,19 @@ of Home Assistant Recorder. Totals start at zero when upgrading from the
 session-only counter. Additional video and audio sensors can be enabled from the
 device page.
 
-**Disturb short videos** is enabled by default for each TV. Once YouTube reports
-that a video is playing and gives its duration, iSponsorBlockTV sends a Back
-command to dismiss videos shorter than the configured threshold (30 seconds by
-default). This also applies to regular videos under the threshold. Videos at or
-above the threshold and ads are excluded. Turn the option off for any TV where
-you want short videos to play.
+Each TV has an **Interrupt short videos** switch in the **Configuration**
+section of its Home Assistant device page. It is on by default. Turn it off to
+stop Shorts interruptions on that TV without reconnecting. The switch and the
+TV's playback options use the same setting.
+
+Once YouTube reports that a video is playing and gives its duration,
+iSponsorBlockTV sends a Back command to dismiss videos shorter than the
+configured threshold (30 seconds by default). This also applies to regular
+videos under the threshold. Videos at or above the threshold and ads are
+excluded.
 
 YouTube can show the Shorts connection warning before it reports a video's
-duration. With **Disturb short videos** enabled, iSponsorBlockTV sends Back once
+duration. With **Interrupt short videos** on, iSponsorBlockTV sends Back once
 if it reconnects within 60 seconds of YouTube reporting a screen-initiated user
 disconnect. This can also happen when you manually disconnect from the TV for
 another reason.
@@ -95,9 +99,13 @@ then select **Disable debug logging** to download the Home Assistant log. Search
 for `custom_components.isponsorblocktv` and your TV's integration name.
 
 The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
-request, whether YouTube acknowledged the request, and whether a disconnect
-triggered the Shorts workaround. An acknowledgment confirms the request was
-accepted. The following playback events show what the TV did.
+request and whether YouTube acknowledged it. An acknowledgment confirms the
+request was accepted. The following playback events show what the TV did.
+
+For a Shorts interruption, find `YouTube Shorts Back result` near the **Last
+YouTube Shorts disruption** timestamp. The trigger shows which rule sent Back.
+For the duration rule, the nearby playback event shows what duration YouTube
+reported, the duration the integration used, and the ad state around the update.
 
 #### Keep live states without history
 

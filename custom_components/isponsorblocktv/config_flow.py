@@ -52,6 +52,7 @@ from .channel_settings import (
 )
 from .const import (
     CONF_DIAL_UDN,
+    CONF_DISTURB_SHORT_VIDEOS,
     CONF_SCREEN_ID,
     DEFAULT_OPTIONS,
     DIAL_SERVICE,
@@ -726,7 +727,7 @@ class ISponsorBlockTVOptionsFlow(OptionsFlowWithReload):
                 probatio.Required("mute_ads", default=options["mute_ads"]): BooleanSelector(),
                 probatio.Required("skip_ads", default=options["skip_ads"]): BooleanSelector(),
                 probatio.Required(
-                    "disturb_short_videos", default=options["disturb_short_videos"]
+                    CONF_DISTURB_SHORT_VIDEOS, default=options[CONF_DISTURB_SHORT_VIDEOS]
                 ): BooleanSelector(),
                 probatio.Required(
                     "short_video_duration_threshold",

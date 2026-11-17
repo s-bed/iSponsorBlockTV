@@ -80,7 +80,7 @@
           "offset": "Skip timing offset",
           "mute_ads": "Mute YouTube ads",
           "skip_ads": "Skip YouTube ads when possible",
-          "disturb_short_videos": "Disturb short videos",
+          "disturb_short_videos": "Interrupt short videos",
           "short_video_duration_threshold": "Short video duration threshold",
           "auto_play": "Enable YouTube autoplay",
           "skip_count_tracking": "Report viewed segments to SponsorBlock"
@@ -199,6 +199,9 @@
       "duration": {"name": "Video duration"},
       "playback_speed": {"name": "Playback speed"},
       "volume": {"name": "Volume"}
+    },
+    "switch": {
+      "disturb_short_videos": {"name": "Interrupt short videos"}
     }
   }
 }

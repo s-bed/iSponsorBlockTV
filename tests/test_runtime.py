@@ -71,8 +71,11 @@ def _playback_runtime(hass, *, blocked_channels=frozenset(), **options):
         ({}, "0", False),
     ],
 )
-async def test_short_video_dismissal_uses_this_tvs_options(hass, options, duration, dismiss):
+async def test_short_video_dismissal_uses_this_tvs_options(
+    hass, caplog, options, duration, dismiss
+):
     tv = _playback_runtime(hass, **options)
+    caplog.set_level(logging.DEBUG, logger=tv._logger.name)
     client = tv._client
     sample = {"videoId": "video", "state": "1", "currentTime": "0"}
     if duration is not None:
@@ -105,6 +108,8 @@ async def test_short_video_dismissal_uses_this_tvs_options(hass, options, durati
             await tv._scheduler.cancel()
 
     assert tv.snapshot.skip_count == 0
+    result = "YouTube Shorts Back result (trigger=duration threshold, acknowledged=True)"
+    assert (result in caplog.text) == dismiss
 
 
 async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
@@ -127,7 +132,8 @@ async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
     assert tv.snapshot.last_short_disruption is None
 
 
-async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_video(hass):
+@pytest.mark.parametrize("change", ["different video", "switch off"])
+async def test_queued_short_dismissal_rechecks_playback_or_switch_state(hass, change):
     tv = _playback_runtime(hass)
     client = tv._client
     with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
@@ -140,12 +146,18 @@ async def test_short_video_dismissal_waiting_for_command_lock_ignores_stale_vide
                 await asyncio.sleep(0)
                 queued = tv._scheduler._pending
                 assert queued is not None
-                await client._process_event(
-                    "nowPlaying",
-                    [{"videoId": "long", "state": "1", "currentTime": "0", "duration": "65"}],
-                )
-            with pytest.raises(asyncio.CancelledError):
+                if change == "switch off":
+                    tv.async_set_disturb_short_videos(False)
+                else:
+                    await client._process_event(
+                        "nowPlaying",
+                        [{"videoId": "long", "state": "1", "currentTime": "0", "duration": "65"}],
+                    )
+            if change == "switch off":
                 await queued
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await queued
             await asyncio.gather(*tv._scheduler._tasks)
         finally:
             await tv._scheduler.cancel()
@@ -183,7 +195,9 @@ async def test_entry_setup_uses_global_blocklist_unless_overridden(
 
 
 async def test_blocked_channel_dismisses_once_without_sponsorblock_or_duration(hass):
-    tv = _playback_runtime(hass, blocked_channels=frozenset({BLOCKED_CHANNEL}))
+    tv = _playback_runtime(
+        hass, blocked_channels=frozenset({BLOCKED_CHANNEL}), disturb_short_videos=False
+    )
     client = tv._client
     with (
         patch.object(
@@ -330,14 +344,19 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
         await client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
         await asyncio.gather(*client._actions)
         await client._process_event("onAdStateChange", [{"adState": "1082", "currentTime": "0"}])
+        await client._process_event(
+            "nowPlaying", [{"videoId": "private-video-id", "state": "1", "duration": "20"}]
+        )
         await client._process_event("onStateChange", [{"state": "2", "currentTime": "8"}])
         await client._process_event(
             "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
         )
         await client._process_event("onSubtitlesTrackChanged", [{"videoId": "private-video-id"}])
         await asyncio.gather(*client._actions)
+        with pytest.raises(ClientError):
+            await client.get_now_playing()
 
-    assert [call.args[0] for call in command.await_args_list] == ["skipAd", "setPlaylist"]
+    assert [call.args[0] for call in command.await_args_list] == ["skipAd", "getNowPlaying"]
     messages = [
         record.getMessage()
         for record in caplog.records
@@ -347,8 +366,14 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
     assert "skipAd acknowledged=True" in log
     assert "ad state code=1082" in log
     assert "playback Playing -> Paused (state code=2, position=8.0 s" in log
-    assert "reason='disconnectedByUserScreenInitiated', Shorts workaround pending=True" in log
-    assert "setPlaylist ended (ClientError)" in log
+    assert (
+        "duration=20.0 s, reported duration=20.0 s, has video=True, video ID reported=True" in log
+    )
+    assert (
+        "duration=20.0 s, reported duration=None s, has video=True, video ID reported=False" in log
+    )
+    assert "reason='disconnectedByUserScreenInitiated', Shorts workaround pending=False" in log
+    assert "getNowPlaying ended (ClientError)" in log
     assert "private-lounge-token" not in caplog.text
     assert "private-video-id" not in caplog.text
     assert SCREEN_ID not in caplog.text
@@ -362,13 +387,20 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
 
 
 @pytest.mark.parametrize(
-    ("has_bind_playback", "expired", "acknowledged"),
-    [(False, False, True), (True, False, True), (False, True, True), (False, False, False)],
+    ("has_bind_playback", "expired", "acknowledged", "enabled"),
+    [
+        (False, False, True, True),
+        (True, False, True, True),
+        (False, True, True, True),
+        (False, False, False, True),
+        (True, False, True, False),
+    ],
 )
 async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
-    hass, has_bind_playback, expired, acknowledged
+    hass, caplog, has_bind_playback, expired, acknowledged, enabled
 ):
     tv = runtime.TVRuntime(hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_categories": []})
+    caplog.set_level(logging.DEBUG, logger=tv._logger.name)
     client = tv._client
     ordinary_reconnect = asyncio.Event()
     connection_attempt = 0
@@ -395,6 +427,8 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
             await client._process_event(
                 "loungeScreenDisconnected", [{"reason": "disconnectedByUserScreenInitiated"}]
             )
+            if not enabled:
+                tv.async_set_disturb_short_videos(False)
         elif connection_attempt == 3:
             await asyncio.gather(*tv._scheduler._tasks)
             await client._process_event("onSubtitlesTrackChanged", [{"videoId": "short"}])
@@ -428,12 +462,22 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
         finally:
             await tv.async_stop()
 
-    if expired:
+    if expired or not enabled:
         command.assert_not_awaited()
+        if expired:
+            assert "disconnect age=61.000 s, window=60 s, Back eligible=False" in caplog.text
+        assert "YouTube Shorts Back result" not in caplog.text
     else:
         command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
         assert back_attempts == [3]
-    assert (tv.snapshot.last_short_disruption is not None) == (not expired and acknowledged)
+        assert "disconnect age=10.000 s, window=60 s, Back eligible=True" in caplog.text
+        result = (
+            f"YouTube Shorts Back result (trigger=screen disconnect, acknowledged={acknowledged})"
+        )
+        assert result in caplog.text
+    assert (tv.snapshot.last_short_disruption is not None) == (
+        enabled and not expired and acknowledged
+    )
 
 
 async def test_confirmed_rejection_creates_native_repair(hass, enable_custom_integrations):
