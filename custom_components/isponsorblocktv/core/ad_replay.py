@@ -287,6 +287,7 @@ class AdReplay:
             if sid is not None:
                 params = {
                     **client._common_connection_parameters(),
+                    "app": body["app"],
                     "loungeIdToken": token,
                     "name": message,
                     "SID": sid,

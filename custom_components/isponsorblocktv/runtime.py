@@ -257,15 +257,15 @@ class TVRuntime:
         loop = asyncio.get_running_loop()
         next_immediate_retry = loop.time()
         retry = RETRY_INTERVAL
-        playback_retry = 0
+        trying_other_binding = False
         while True:
             retry_promptly = False
-            playback_events_before = self._client.playback_event_count
             try:
                 self._client.auth.lounge_id_token = await self._async_verify()
                 if not await self._client.is_available():
                     self._logger.debug("YouTube screen is unavailable")
                 elif await self._client.connect():
+                    trying_other_binding = False
                     self._logger.debug(
                         "Connected to YouTube Lounge (skip ads=%s, mute ads=%s)",
                         self._client.skip_ads,
@@ -277,18 +277,16 @@ class TVRuntime:
                     self._async_publish(connected=True)
                     self._async_lounge_updated()
                     await self._async_listen()
-                    if self._client.playback_event_count != playback_events_before:
-                        playback_retry = 0
                     retry_promptly = self._client.screen_disconnected_without_reason
             except PlaybackResponseTimeout:
-                if self._client.playback_event_count != playback_events_before:
-                    playback_retry = 0
-                retry_promptly = playback_retry == 0
-                retry = playback_retry or RETRY_INTERVAL
-                playback_retry = min(retry * 2, MAX_RETRY_INTERVAL)
+                await self._async_cleanup()
+                self._client.use_web_binding = not self._client.use_web_binding
+                trying_other_binding = True
                 self._logger.debug(
-                    "Renewing YouTube Lounge session after unanswered playback request"
+                    "Trying the %s Lounge client after an unanswered playback request",
+                    "web" if self._client.use_web_binding else "mobile",
                 )
+                continue
             except PairingRejected:
                 self._logger.debug("YouTube rejected the saved pairing (%s)", self._rejections)
                 if self._rejections >= 2:
@@ -301,6 +299,10 @@ class TVRuntime:
                 self._logger.debug("YouTube connection failed (%s)", type(err).__name__)
 
             await self._async_cleanup()
+            if trying_other_binding:
+                # The alternate client could not connect. Return to the last usable binding.
+                self._client.use_web_binding = not self._client.use_web_binding
+                trying_other_binding = False
             if retry_promptly and (now := loop.time()) >= next_immediate_retry:
                 # Rate-limit the immediate retry in case the screen keeps dropping the session.
                 next_immediate_retry = now + RETRY_INTERVAL

@@ -133,10 +133,14 @@ For a disconnect, look for `Sending YouTube Lounge keepalive` and the following
 `getNowPlaying` acknowledgment. The integration sends this request after about
 a minute without a Lounge command while the TV is connected.
 
-If an acknowledged playback request produces no playback or ad update within
-15 seconds, the integration renews the Lounge session. Heartbeats alone do not
-count as a playback reply. Look for `YouTube playback request unanswered` and
-`Renewing YouTube Lounge session` in the debug log.
+Look for `YouTube receiver presence changed` to see whether the TV app joined
+the Lounge session. When it joins, the integration asks for its current playback
+if the TV has not already reported it. If a request goes unanswered for 15
+seconds, the integration can try the other Lounge client profile (mobile or web)
+once. If neither receives a playback update, the listener stays open for late
+reports and continues its periodic checks. Another profile change is possible
+after the TV reports playback or an ad. Live entities can show **Unknown** while
+waiting for their first report and **Unavailable** while disconnected.
 
 For the five-second ad workaround, look for `Pausing non-skippable YouTube ad`
 and `Reloaded content after non-skippable YouTube ad`. The pause entry includes

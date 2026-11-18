@@ -54,6 +54,58 @@ async def test_acknowledged_query_times_out_despite_heartbeat_traffic(monkeypatc
     assert client._subscription is client._watchdog_task is None
 
 
+@pytest.mark.parametrize("receiver_absent", [False, True])
+async def test_another_missed_query_keeps_subscription_available_for_late_events(
+    monkeypatch, clock, receiver_absent
+):
+    client = _client()
+    client.receiver_present = False if receiver_absent else True
+    client._binding_retry_used = not receiver_absent
+    subscribed = asyncio.Event()
+
+    async def subscribe(_client):
+        subscribed.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
+    monkeypatch.setattr(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0)
+    callback = AsyncMock()
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(client, "_send_command", send)
+    await client.get_now_playing()
+    task = asyncio.create_task(client.run_subscription(callback))
+    try:
+        await asyncio.wait_for(subscribed.wait(), timeout=1)
+        clock.elapsed += ytlounge._PLAYBACK_REPLY_TIMEOUT + 1
+        await client._process_event("noop", [])
+        async with asyncio.timeout(1):
+            while client._playback_request_at is not None:
+                await asyncio.sleep(0)
+        assert not task.done()
+        assert client.connected()
+
+        if not receiver_absent:
+            clock.elapsed += 61
+            await client._process_event("noop", [])
+            async with asyncio.timeout(1):
+                while send.await_count < 2:
+                    await asyncio.sleep(0)
+            assert send.await_args.args == ("getNowPlaying", None)
+            assert not task.done()
+
+        # A late receiver report still reaches the regular playback callback.
+        await client._process_event(
+            "nowPlaying",
+            [{"videoId": "content", "state": "1", "currentTime": "20", "duration": "100"}],
+        )
+        callback.assert_awaited_once()
+        assert callback.await_args.args[0].videoId == "content"
+        assert not client._binding_retry_used
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     ("event", "data"),
     [

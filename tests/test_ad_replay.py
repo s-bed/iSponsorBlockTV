@@ -186,6 +186,7 @@ async def test_countdown_toast_terminates_its_remote_without_changing_main_sessi
     request = AsyncMock()
     request.__aenter__.return_value = response
     client = _client()
+    client.use_web_binding = True
     client.auth.lounge_id_token = "test-token"
     client.session = SimpleNamespace(post=Mock(return_value=request))
     await client._ad_replay._send_toast("Ad will be skipped in 5 seconds")
@@ -194,6 +195,7 @@ async def test_countdown_toast_terminates_its_remote_without_changing_main_sessi
     assert connection.kwargs["data"]["name"] == "Ad will be skipped in 5 seconds"
     assert connection.kwargs["data"]["capabilities"] == "que,atp,vsp,ndt"
     assert cleanup.kwargs["data"]["TYPE"] == "terminate"
+    assert cleanup.kwargs["params"]["app"] == connection.kwargs["data"]["app"]
     assert cleanup.kwargs["params"]["SID"] == "toast-sid"
     assert cleanup.kwargs["params"]["gsessionid"] == "toast-gsession"
     assert client._sid == client._gsession == "connected"
