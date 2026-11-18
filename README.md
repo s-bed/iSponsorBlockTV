@@ -133,6 +133,11 @@ For a disconnect, look for `Sending YouTube Lounge keepalive` and the following
 `getNowPlaying` acknowledgment. The integration sends this request after about
 a minute without a Lounge command while the TV is connected.
 
+If an acknowledged playback request produces no playback or ad update within
+15 seconds, the integration renews the Lounge session. Heartbeats alone do not
+count as a playback reply. Look for `YouTube playback request unanswered` and
+`Renewing YouTube Lounge session` in the debug log.
+
 For the five-second ad workaround, look for `Pausing non-skippable YouTube ad`
 and `Reloaded content after non-skippable YouTube ad`. The pause entry includes
 the saved content position and remaining countdown.

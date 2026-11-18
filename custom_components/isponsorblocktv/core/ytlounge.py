@@ -24,6 +24,11 @@ _REQUEST_TIMEOUT = 10
 _RECONNECT_BACK_WINDOW = 60
 _KEEPALIVE_IDLE_INTERVAL = 60
 _WATCHDOG_POLL_INTERVAL = 10
+_PLAYBACK_REPLY_TIMEOUT = 15
+
+
+class PlaybackResponseTimeout(TimeoutError):
+    """The receiver stopped answering playback requests on a live Lounge session."""
 
 
 @dataclass
@@ -84,6 +89,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.skip_ads = config.skip_ads if config else False
         self._muted_for_ad = False
         self.last_event_time: float | None = None
+        self.playback_event_count = 0
+        self._playback_request_at: float | None = None
         self._last_command_at: float | None = None
         self._command_mutex = asyncio.Lock()
         self._ad_mutex = asyncio.Lock()
@@ -130,6 +137,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._connection_lost()
         self.screen_disconnected_without_reason = False
         self._last_command_at = None
+        self._playback_request_at = None
         self._ad_replay.reset()
         self.reset_playback()
 
@@ -213,6 +221,16 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         """Watch the event stream and refresh idle Lounge sessions."""
         loop = asyncio.get_running_loop()
         while (now := loop.time()) - (self.last_event_time or started_at) <= 60:
+            if (
+                self._playback_request_at is not None
+                and now - self._playback_request_at >= _PLAYBACK_REPLY_TIMEOUT
+            ):
+                self.logger.debug(
+                    "YouTube playback request unanswered (age=%.1f s, event age=%.1f s)",
+                    now - self._playback_request_at,
+                    now - (self.last_event_time or started_at),
+                )
+                raise PlaybackResponseTimeout
             last_command_at = self._last_command_at or started_at
             if self.connected() and now - last_command_at >= _KEEPALIVE_IDLE_INTERVAL:
                 self._start_action(self._send_keepalive, started_at)
@@ -348,6 +366,13 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     async def _process_event(self, event_type: str, args: list[Any]):
         self.last_event_time = asyncio.get_running_loop().time()
         data = args[0] if args and isinstance(args[0], dict) else {}
+        if (
+            args
+            and isinstance(args[0], dict)
+            and event_type in {"nowPlaying", "onStateChange", "onAdStateChange", "adPlaying"}
+        ):
+            self._playback_request_at = None
+            self.playback_event_count += 1
         telemetry_changed = True
 
         if event_type in {"onStateChange", "nowPlaying"}:
@@ -479,16 +504,28 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         *,
         only_if: Callable[[], bool] | None = None,
     ) -> bool:
+        acknowledged = False
+        new_query_at = None
         try:
             async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
                 if only_if is not None and not only_if():
                     return False
                 self._last_command_at = asyncio.get_running_loop().time()
+                if command == "getNowPlaying" and self._playback_request_at is None:
+                    new_query_at = self._last_command_at
+                    self._playback_request_at = new_query_at
                 self.logger.debug("Sending YouTube Lounge command %s", command)
                 acknowledged = await self._send_command(command, command_parameters)
         except (Exception, asyncio.CancelledError) as err:
             self.logger.debug("YouTube Lounge command %s ended (%s)", command, type(err).__name__)
             raise
+        finally:
+            if (
+                not acknowledged
+                and new_query_at is not None
+                and self._playback_request_at == new_query_at
+            ):
+                self._playback_request_at = None
         self.logger.debug("YouTube Lounge command %s acknowledged=%s", command, acknowledged)
         return acknowledged
 

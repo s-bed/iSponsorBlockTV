@@ -21,7 +21,7 @@ from .const import CONF_DISTURB_SHORT_VIDEOS, CONF_SCREEN_ID, DOMAIN
 from .core.api_helpers import ApiHelper
 from .core.pairing import PairingRejected, PairingUnavailable, async_verify_screen_id
 from .core.playback import PlaybackScheduler
-from .core.ytlounge import YtLoungeApi
+from .core.ytlounge import PlaybackResponseTimeout, YtLoungeApi
 
 AUTH_CHECK_INTERVAL = 15 * 60
 RETRY_INTERVAL = 10
@@ -257,8 +257,10 @@ class TVRuntime:
         loop = asyncio.get_running_loop()
         next_immediate_retry = loop.time()
         retry = RETRY_INTERVAL
+        playback_retry = 0
         while True:
-            disconnected_without_reason = False
+            retry_promptly = False
+            playback_events_before = self._client.playback_event_count
             try:
                 self._client.auth.lounge_id_token = await self._async_verify()
                 if not await self._client.is_available():
@@ -275,7 +277,18 @@ class TVRuntime:
                     self._async_publish(connected=True)
                     self._async_lounge_updated()
                     await self._async_listen()
-                    disconnected_without_reason = self._client.screen_disconnected_without_reason
+                    if self._client.playback_event_count != playback_events_before:
+                        playback_retry = 0
+                    retry_promptly = self._client.screen_disconnected_without_reason
+            except PlaybackResponseTimeout:
+                if self._client.playback_event_count != playback_events_before:
+                    playback_retry = 0
+                retry_promptly = playback_retry == 0
+                retry = playback_retry or RETRY_INTERVAL
+                playback_retry = min(retry * 2, MAX_RETRY_INTERVAL)
+                self._logger.debug(
+                    "Renewing YouTube Lounge session after unanswered playback request"
+                )
             except PairingRejected:
                 self._logger.debug("YouTube rejected the saved pairing (%s)", self._rejections)
                 if self._rejections >= 2:
@@ -288,12 +301,10 @@ class TVRuntime:
                 self._logger.debug("YouTube connection failed (%s)", type(err).__name__)
 
             await self._async_cleanup()
-            if disconnected_without_reason and (now := loop.time()) >= next_immediate_retry:
+            if retry_promptly and (now := loop.time()) >= next_immediate_retry:
                 # Rate-limit the immediate retry in case the screen keeps dropping the session.
                 next_immediate_retry = now + RETRY_INTERVAL
-                self._logger.debug(
-                    "Reconnecting to YouTube Lounge after a disconnect with no reason"
-                )
+                self._logger.debug("Reconnecting to YouTube Lounge promptly")
                 continue
             self._logger.debug("Retrying YouTube Lounge connection in %s s", retry)
             await asyncio.sleep(retry)
@@ -342,6 +353,8 @@ class TVRuntime:
                 try:
                     if await subscription:
                         retries = 0
+                except PlaybackResponseTimeout:
+                    raise
                 except (ClientError, TimeoutError) as err:
                     self._logger.debug(
                         "YouTube Lounge event stream failed (%s)", type(err).__name__

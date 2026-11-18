@@ -630,6 +630,51 @@ async def test_disconnect_without_reason_retries_immediately_once_without_back(h
     assert tv.snapshot.last_short_disruption is None
 
 
+async def test_unanswered_playback_requests_renew_session_then_back_off(hass):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    client._request_initial_playback = True
+    backing_off = asyncio.Event()
+
+    async def connect():
+        client._sid = client._gsession = "connected"
+        return True
+
+    async def subscribe():
+        await client._process_event("noop", [])
+        await asyncio.Future()
+
+    def record_retry(message, *args):
+        if message == "Retrying YouTube Lounge connection in %s s":
+            backing_off.set()
+
+    with (
+        patch.object(ytlounge, "_PLAYBACK_REPLY_TIMEOUT", 0),
+        patch.object(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect) as bind,
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True) as terminate,
+        patch.object(client, "_send_command", return_value=True) as command,
+        patch.object(tv._logger, "debug", side_effect=record_retry),
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(backing_off.wait(), timeout=2)
+        finally:
+            await tv.async_stop()
+
+    assert bind.await_count == 2
+    terminate.assert_not_awaited()
+    assert command.await_args_list == [call("getNowPlaying", None), call("getNowPlaying", None)]
+    assert tv.snapshot.last_short_disruption is None
+
+
 @pytest.mark.parametrize(
     ("stream_ends", "invalid_session"),
     [(1, False), (1, True), (3, False)],
