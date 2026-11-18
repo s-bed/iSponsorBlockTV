@@ -10,10 +10,11 @@ from typing import Any
 
 import pyytlounge
 from aiohttp import ClientSession
-from pyytlounge.models import DpadCommand, State
+from pyytlounge.models import BLACKLISTED_CLIENTS, DpadCommand, State
 from pyytlounge.wrapper import NotLinkedException, api_base, as_aiter
 
 from .constants import youtube_client_blacklist
+from .ad_replay import AdReplay
 
 _LOGGER = logging.getLogger(__name__)
 _WIRE_LOGGER = logging.getLogger(f"{__name__}.wire")
@@ -21,6 +22,13 @@ _WIRE_LOGGER.addHandler(logging.NullHandler())
 _WIRE_LOGGER.propagate = False
 _REQUEST_TIMEOUT = 10
 _RECONNECT_BACK_WINDOW = 60
+_KEEPALIVE_IDLE_INTERVAL = 60
+_WATCHDOG_POLL_INTERVAL = 10
+_PLAYBACK_REPLY_TIMEOUT = 15
+
+
+class PlaybackResponseTimeout(TimeoutError):
+    """The receiver stopped answering playback requests on a live Lounge session."""
 
 
 @dataclass
@@ -29,6 +37,14 @@ class PlaybackState:
     duration: float | None = None
     videoId: str = ""
     state: State = State.Stopped
+
+
+@dataclass(slots=True)
+class _AdSkipAttempt:
+    """Keep acknowledgment accounting tied to the ad a command targeted."""
+
+    ad_video_id: str | None
+    counted: bool = False
 
 
 def _nonnegative_float(value) -> float | None:
@@ -49,6 +65,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         *,
         web_session: ClientSession | None = None,
         on_update=None,
+        on_ad_skip: Callable[[], None] | None = None,
         request_initial_playback: bool = False,
     ):
         self.logger = logger or _LOGGER
@@ -58,6 +75,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         )
         self.session = web_session
         self._on_update = on_update
+        self._on_ad_skip = on_ad_skip
+        self._ad_skip_attempt: _AdSkipAttempt | None = None
         self._request_initial_playback = request_initial_playback
         self.auth.screen_id = screen_id
         self.auth.lounge_id_token = None
@@ -73,6 +92,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self._actions = set()
         self._state_callback = None
         self.playback_state = None
+        self.screen_disconnected_without_reason = False
         self._shorts_disconnected_at: float | None = None
         self._disturb_short_videos = getattr(config, "disturb_short_videos", False)
         self.auto_play = config.auto_play if config else True
@@ -80,8 +100,17 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.skip_ads = config.skip_ads if config else False
         self._muted_for_ad = False
         self.last_event_time: float | None = None
+        self._binding_retry_used = False
+        self.receiver_present: bool | None = None
+        self._receiver_has_playback = False
+        self._playback_query_task = None
+        self._playback_request_at: float | None = None
+        self._last_command_at: float | None = None
         self._command_mutex = asyncio.Lock()
         self._ad_mutex = asyncio.Lock()
+        self._command_message_offset = 1
+        self.use_web_binding = False
+        self._ad_replay = AdReplay(self, getattr(config, "offset", 0) / 1000)
 
     @property
     def disturb_short_videos(self) -> bool:
@@ -116,11 +145,19 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.volume_state = {}
         self.ad_playing = None
         self.ad_skippable = None
+        self._ad_skip_attempt = None
         self._notify_update()
 
     def reset_session(self) -> None:
         """Discard the local session and playback state."""
         self._connection_lost()
+        self.screen_disconnected_without_reason = False
+        self._last_command_at = None
+        self._playback_request_at = None
+        self.receiver_present = None
+        self._receiver_has_playback = False
+        self._playback_query_task = None
+        self._ad_replay.reset()
         self.reset_playback()
 
     def _notify_update(self):
@@ -136,14 +173,41 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             state = State(state_code)
         except TypeError, ValueError, OverflowError:
             state = State.Stopped
-        if state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
-            self._set_ad(False, source=event_type)
-        elif state is State.Advertisement and not self.ad_playing:
-            self._set_ad(True, source=event_type)
         video_id = data.get("videoId", "" if event_type == "nowPlaying" else previous.videoId)
+        ad_video_id = data.get("adVideoId")
+        explicit_ad = bool(ad_video_id) or data.get("adState") in ("1", 1)
+        discovering_ad_content = (
+            not self._ad_replay.video_id
+            and self.ad_playing
+            and (state is State.Advertisement or explicit_ad)
+        )
+        if isinstance(video_id, str) and video_id and video_id != self._ad_replay.video_id:
+            self._ad_replay.video_changed(video_id)
+            if not discovering_ad_content:
+                self._set_ad(False, source=event_type)
+        reported_duration = _nonnegative_float(data.get("duration"))
+        inferred_ad = self._ad_replay.looks_like_ad(video_id, reported_duration)
+        continuing_ad = (
+            self.ad_playing
+            and state is not State.AdSkipped
+            and self._ad_replay.duration is not None
+            and (reported_duration is None or reported_duration <= 0)
+            and bool(video_id or event_type == "onStateChange")
+        )
+        if state is State.AdSkipped:
+            self._set_ad(False, source=event_type)
+        elif inferred_ad or explicit_ad or continuing_ad or state is State.Advertisement:
+            state = State.Advertisement
+            self._set_ad(
+                True,
+                self.ad_skippable or False,
+                source=event_type,
+                ad_video_id=ad_video_id,
+            )
+        elif state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
+            self._set_ad(False, source=event_type)
         if not isinstance(video_id, str) or state in (State.Stopped, State.Buffering):
             video_id = ""
-        reported_duration = _nonnegative_float(data.get("duration"))
         duration = reported_duration
         # Lounge can report an ad's duration with the content's video ID.
         ad_states = (State.Advertisement, State.AdSkipped)
@@ -159,6 +223,10 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             duration=duration if video_id else None,
             videoId=video_id,
             state=state,
+        )
+        self._ad_replay.observe(
+            self.playback_state,
+            clear_content=event_type == "nowPlaying" and not self.playback_state.videoId,
         )
         self.logger.debug(
             "YouTube %s: playback %s -> %s (state code=%s, position=%s s, duration=%s s, "
@@ -181,11 +249,42 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             await self._state_callback(self.playback_state)
 
     async def _watchdog(self, started_at: float):
-        """Finish a subscription that has stopped receiving events."""
+        """Watch the event stream and refresh idle Lounge sessions."""
         loop = asyncio.get_running_loop()
-        while loop.time() - (self.last_event_time or started_at) <= 60:
-            await asyncio.sleep(10)
+        while (now := loop.time()) - (self.last_event_time or started_at) <= 60:
+            if (
+                self._playback_request_at is not None
+                and now - self._playback_request_at >= _PLAYBACK_REPLY_TIMEOUT
+            ):
+                self.logger.debug(
+                    "YouTube playback request unanswered (age=%.1f s, event age=%.1f s, "
+                    "receiver present=%s)",
+                    now - self._playback_request_at,
+                    now - (self.last_event_time or started_at),
+                    self.receiver_present,
+                )
+                self._playback_request_at = None
+                if self.receiver_present is not False and not self._binding_retry_used:
+                    # Try the other client profile once, until the TV reports playback again.
+                    self._binding_retry_used = True
+                    raise PlaybackResponseTimeout
+                self.logger.debug("Keeping YouTube Lounge listener open for playback reports")
+            last_command_at = self._last_command_at or started_at
+            if self.connected() and now - last_command_at >= _KEEPALIVE_IDLE_INTERVAL:
+                self._start_action(self._send_keepalive, started_at)
+            await asyncio.sleep(_WATCHDOG_POLL_INTERVAL)
         self.logger.debug("YouTube Lounge subscription stopped receiving events")
+
+    async def _send_keepalive(self, started_at: float) -> None:
+        def still_idle() -> bool:
+            last_command_at = self._last_command_at or started_at
+            idle = asyncio.get_running_loop().time() - last_command_at
+            if not self.connected() or idle < _KEEPALIVE_IDLE_INTERVAL:
+                return False
+            self.logger.debug("Sending YouTube Lounge keepalive (getNowPlaying, idle=%.1f s)", idle)
+            return True
+
+        await self.get_now_playing(only_if=still_idle)
 
     async def run_subscription(self, callback, *, resume: bool = False) -> bool:
         """Run the event stream and report whether it received events."""
@@ -200,11 +299,15 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         watchdog = self._watchdog_task = asyncio.create_task(
             self._watchdog(asyncio.get_running_loop().time())
         )
-        if resume or (
-            self._request_initial_playback
-            and (self.playback_state is None or not self.playback_state.videoId)
+        if (
+            (self.receiver_present and not self._receiver_has_playback)
+            or resume
+            or (
+                self._request_initial_playback
+                and (self.playback_state is None or not self.playback_state.videoId)
+            )
         ):
-            self._start_action(self.get_now_playing)
+            self._queue_playback_query()
         self.logger.debug("Listening for YouTube Lounge events (resumed=%s)", resume)
         try:
             done, _ = await asyncio.wait(
@@ -223,6 +326,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     async def stop_subscription(self):
         """Cancel and wait for subscription and event-triggered work."""
         self._state_callback = None
+        self._ad_replay.cancel()
         tasks = set(self._actions)
         tasks.update(task for task in (self._subscription, self._watchdog_task) if task)
         self._subscription = self._watchdog_task = None
@@ -234,6 +338,63 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         task = asyncio.create_task(self._run_action(action, args))
         self._actions.add(task)
         task.add_done_callback(self._actions.discard)
+        return task
+
+    def _queue_playback_query(self) -> None:
+        if self._playback_query_task is not None and not self._playback_query_task.done():
+            return
+        self._playback_query_task = self._start_action(self.get_now_playing)
+
+    def _receiver_presence_changed(self, present: bool) -> None:
+        if self.receiver_present is present:
+            return
+        self.receiver_present = present
+        self.logger.debug("YouTube receiver presence changed (present=%s)", present)
+        if self._playback_request_at is not None:
+            # A request sent before the screen joined may never reach it. Let an in-flight
+            # POST finish in order; the command lock serializes the new request behind it.
+            self._playback_request_at = None
+            self._playback_query_task = None
+        if not present:
+            self._receiver_has_playback = False
+            return
+        if not self._receiver_has_playback and self._subscription and not self._subscription.done():
+            self._queue_playback_query()
+
+    def _handle_receiver_roster(self, data: dict) -> None:
+        devices = data.get("devices")
+        if isinstance(devices, str):
+            try:
+                devices = json.loads(devices)
+            except ValueError:
+                devices = None
+        if not isinstance(devices, list) or any(not isinstance(device, dict) for device in devices):
+            self.logger.debug("Ignoring invalid YouTube receiver roster")
+            return
+        screens = []
+        for screen in devices:
+            if screen.get("type") != "LOUNGE_SCREEN":
+                continue
+            info = screen.get("deviceInfo")
+            if isinstance(info, str):
+                try:
+                    info = json.loads(info)
+                except ValueError:
+                    info = None
+            if not isinstance(info, dict):
+                info = None
+            if info and info.get("clientName") in (*youtube_client_blacklist, *BLACKLISTED_CLIENTS):
+                self.logger.debug("YouTube Lounge session cleared for an unsupported client")
+                self._receiver_presence_changed(False)
+                self._connection_lost()
+                return
+            screens.append((screen, info))
+        if screens:
+            screen, info = screens[0]
+            if isinstance(name := screen.get("name"), str):
+                self._screen_name = name
+            self._device_info = info
+        self._receiver_presence_changed(bool(screens))
 
     async def _run_action(self, action, args):
         try:
@@ -249,19 +410,72 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 if self._muted_for_ad and await self.mute(False, override=True):
                     self._muted_for_ad = False
             elif self.skip_ads and self.ad_skippable:
-                if (
-                    await self.skip_ad()
-                    and self._muted_for_ad
-                    and await self.mute(False, override=True)
-                ):
-                    self._muted_for_ad = False
+                attempt = self._ad_skip_attempt
+
+                def before_skip():
+                    return (
+                        self._ad_skip_attempt is attempt
+                        and self.ad_playing
+                        and self.ad_skippable
+                        and self.skip_ads
+                    )
+
+                try:
+                    if self._muted_for_ad:
+                        skipped = await self._commands(
+                            [
+                                ("skipAd", None),
+                                (
+                                    "setVolume",
+                                    {
+                                        "volume": self.volume_state.get("volume", 100),
+                                        "muted": "false",
+                                    },
+                                ),
+                            ],
+                            only_if=before_skip,
+                        )
+                        if skipped:
+                            self._muted_for_ad = False
+                    else:
+                        skipped = await self._command("skipAd", only_if=before_skip)
+                except Exception:
+                    if self._ad_skip_attempt is attempt:
+                        await self._ad_replay.resume_paused_ad()
+                    raise
+                if skipped:
+                    self._record_ad_skip(attempt)
+                elif self._ad_skip_attempt is attempt:
+                    await self._ad_replay.resume_paused_ad()
             elif self.mute_ads and self.muted is not True and not self._muted_for_ad:
                 # A disconnect may cancel the response after the command has reached the TV.
                 self._muted_for_ad = True
                 if not await self.mute(True, override=True):
                     self._muted_for_ad = False
 
-    def _set_ad(self, playing, skippable=False, *, source):
+    def _record_ad_skip(self, attempt: _AdSkipAttempt | None) -> None:
+        """Count the acknowledged command once even if the next ad has started."""
+        if attempt is None or attempt.counted:
+            return
+        attempt.counted = True
+        if self._on_ad_skip is not None:
+            self._on_ad_skip()
+
+    def _set_ad(self, playing, skippable=False, *, source, ad_video_id=None):
+        ad_video_id = ad_video_id if isinstance(ad_video_id, str) and ad_video_id else None
+        attempt = self._ad_skip_attempt
+        new_ad = playing and (
+            attempt is None
+            or (ad_video_id is not None and attempt.ad_video_id not in (None, ad_video_id))
+        )
+        if new_ad:
+            self._ad_skip_attempt = _AdSkipAttempt(ad_video_id)
+            self._ad_replay.ad_started()
+        elif playing and ad_video_id is not None:
+            attempt.ad_video_id = ad_video_id
+        elif not playing and self.ad_playing:
+            self._ad_skip_attempt = None
+            self._ad_replay.ad_ended()
         if (playing, skippable) != (self.ad_playing, self.ad_skippable):
             self.logger.debug(
                 "YouTube %s: interpreted ad state (playing=%s, skippable=%s)",
@@ -271,7 +485,11 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             )
         self.ad_playing = playing
         self.ad_skippable = skippable
-        if self._muted_for_ad or (playing and (self.mute_ads or self.skip_ads)):
+        if playing and skippable:
+            self._ad_replay.cancel(keep_paused=True)
+        if (self._muted_for_ad and not self._ad_replay.restoring_content) or (
+            playing and (self.mute_ads or self.skip_ads)
+        ):
             self._start_action(self._apply_ad_behavior)
 
     # Process a lounge subscription event
@@ -279,6 +497,15 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
     async def _process_event(self, event_type: str, args: list[Any]):
         self.last_event_time = asyncio.get_running_loop().time()
         data = args[0] if args and isinstance(args[0], dict) else {}
+        if (
+            args
+            and isinstance(args[0], dict)
+            and event_type in {"nowPlaying", "onStateChange", "onAdStateChange", "adPlaying"}
+        ):
+            self._receiver_has_playback = True
+            self._playback_request_at = None
+            self._binding_retry_used = False
+            self._receiver_presence_changed(True)
         telemetry_changed = True
 
         if event_type in {"onStateChange", "nowPlaying"}:
@@ -295,7 +522,9 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             if ad_state == "1082" or (ad_state == "0" and data.get("currentTime") != "0"):
                 self._set_ad(False, source=event_type)
             elif ad_state:
-                self._set_ad(True, skip_enabled, source=event_type)
+                self._set_ad(
+                    True, skip_enabled, source=event_type, ad_video_id=data.get("adVideoId")
+                )
         elif event_type == "onVolumeChanged":
             self.volume_state = data
             self.logger.debug("YouTube onVolumeChanged: muted=%s", self.muted)
@@ -306,26 +535,35 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "adPlaying":
             if self.api_helper and (video_id := data.get("contentVideoId")):
                 self._start_action(self.api_helper.get_segments, video_id)
-            self._set_ad(True, data.get("isSkipEnabled") in ("true", True), source=event_type)
+            self._set_ad(
+                True,
+                data.get("isSkipEnabled") in ("true", True),
+                source=event_type,
+                ad_video_id=data.get("adVideoId"),
+            )
+            if (
+                self.skip_ads
+                and data.get("isSkippable") in ("false", False)
+                and not self.ad_skippable
+            ):
+                if isinstance(video_id := data.get("contentVideoId"), str) and video_id:
+                    self._ad_replay.video_changed(video_id)
+                self._ad_replay.start(_nonnegative_float(data.get("currentTime")) or 0)
         elif event_type == "loungeStatus":
-            devices = json.loads(data["devices"])
-            for device in devices:
-                if device["type"] == "LOUNGE_SCREEN":
-                    device_info = json.loads(device.get("deviceInfo", "{}")) or {}
-                    if device_info.get("clientName", "") in youtube_client_blacklist:
-                        self.logger.debug(
-                            "YouTube Lounge session cleared for an unsupported client"
-                        )
-                        self._connection_lost()
-                        return
+            self._handle_receiver_roster(data)
+        elif event_type == "loungeScreenConnected":
+            self._receiver_presence_changed(True)
         elif event_type == "loungeScreenDisconnected":
+            self._receiver_presence_changed(False)
             reason = data.get("reason")
+            reason = reason if isinstance(reason, str) else None
+            self.screen_disconnected_without_reason = reason is None
             if reason == "disconnectedByUserScreenInitiated" and self._disturb_short_videos:
                 self._shorts_disconnected_at = monotonic()
             self.logger.debug(
                 "YouTube loungeScreenDisconnected: reason=%r, Shorts workaround pending=%s, "
                 "reconnect Back enabled=%s",
-                reason if isinstance(reason, str) else None,
+                reason,
                 self._shorts_disconnected_at is not None,
                 self._disturb_short_videos,
             )
@@ -339,7 +577,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         else:
             telemetry_changed = False
 
-        if event_type in {"loungeStatus", "loungeScreenDisconnected"}:
+        if event_type == "loungeScreenDisconnected":
             await super()._process_event(event_type, args)
         if telemetry_changed:
             self._notify_update()
@@ -367,8 +605,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             )
         return True
 
-    async def get_now_playing(self):
-        return await self._command("getNowPlaying")
+    async def get_now_playing(self, *, only_if: Callable[[], bool] | None = None) -> bool:
+        return await self._command("getNowPlaying", only_if=only_if)
 
     def take_reconnect_back(self) -> bool:
         """Consume a recent screen disconnect after a successful connection."""
@@ -400,17 +638,69 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         *,
         only_if: Callable[[], bool] | None = None,
     ) -> bool:
+        acknowledged = False
+        new_query_at = None
         try:
             async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
                 if only_if is not None and not only_if():
                     return False
+                self._last_command_at = asyncio.get_running_loop().time()
+                if command == "getNowPlaying" and self._playback_request_at is None:
+                    new_query_at = self._last_command_at
+                    self._playback_request_at = new_query_at
                 self.logger.debug("Sending YouTube Lounge command %s", command)
-                acknowledged = await super()._command(command, command_parameters)
+                acknowledged = await self._send_command(command, command_parameters)
         except (Exception, asyncio.CancelledError) as err:
             self.logger.debug("YouTube Lounge command %s ended (%s)", command, type(err).__name__)
             raise
+        finally:
+            if (
+                not acknowledged
+                and new_query_at is not None
+                and self._playback_request_at == new_query_at
+            ):
+                self._playback_request_at = None
         self.logger.debug("YouTube Lounge command %s acknowledged=%s", command, acknowledged)
         return acknowledged
+
+    async def _send_command(self, command: str, parameters: dict | None) -> bool:
+        """Send one command through the same message counters as command batches."""
+        return await self._send_commands([(command, parameters)])
+
+    async def _commands(self, commands: list[tuple[str, dict | None]], *, only_if=None) -> bool:
+        """Send an ordered batch while holding the regular command lock."""
+        async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
+            if only_if is not None and not only_if():
+                return False
+            self._last_command_at = asyncio.get_running_loop().time()
+            self.logger.debug(
+                "Sending YouTube Lounge command batch %s", [command for command, _ in commands]
+            )
+            acknowledged = await self._send_commands(commands)
+        self.logger.debug("YouTube Lounge command batch acknowledged=%s", acknowledged)
+        return acknowledged
+
+    async def _send_commands(self, commands: list[tuple[str, dict | None]]) -> bool:
+        if not commands:
+            raise ValueError("At least one Lounge command is required")
+        if not self.connected():
+            return False
+        body = {"count": len(commands), "ofs": self._command_message_offset}
+        for index, (command, parameters) in enumerate(commands):
+            body[f"req{index}__sc"] = command
+            for name, value in (parameters or {}).items():
+                body[f"req{index}_{name}"] = value
+        self._command_message_offset += len(commands)
+        self._command_offset += 1
+        params = {**self._common_connection_parameters(), "RID": self._command_offset}
+        async with self._required_session.post(
+            url=f"{api_base}/bc/bind", data=body, params=params
+        ) as response:
+            text = await response.text()
+            if not self._handle_session_result(response.status, text):
+                return False
+            response.raise_for_status()
+            return True
 
     def _handle_session_result(self, status_code: int, reason: str) -> bool:
         accepted = super()._handle_session_result(status_code, reason)
@@ -446,65 +736,65 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self._connection_lost()
 
     def _common_connection_parameters(self) -> dict[str, Any]:
-        return {
-            "name": self.device_name,
-            "loungeIdToken": self.auth.lounge_id_token,
-            "SID": self._sid,
-            "AID": self._last_event_id,
-            "gsessionid": self._gsession,
-            "device": "REMOTE_CONTROL",
-            "app": "ytios-phone-20.15.1",
-            "VER": "8",
-            "v": "2",
-        }
+        params = super()._common_connection_parameters()
+        if not self.use_web_binding:
+            params["app"] = "ytios-phone-20.15.1"
+        return params
 
     async def connect(self) -> bool:
-        """Attempt to connect using the previously set tokens"""
+        """Bind one receiver profile before any bootstrap commands can run."""
         if not self.linked():
             raise NotLinkedException("Not linked")
+        profile = "web" if self.use_web_binding else "mobile"
+        try:
+            async with asyncio.timeout(_REQUEST_TIMEOUT), self._command_mutex:
+                self._connection_lost()
+                self._command_offset = self._command_message_offset = 1
+                if self.use_web_binding:
+                    connected = await super().connect()
+                    self.logger.debug(
+                        "YouTube Lounge connection result (profile=web, connected=%s)", connected
+                    )
+                    return connected
 
-        connect_body = {
-            "id": self.auth.device_id,
-            "mdx-version": "3",
-            "TYPE": "xmlhttp",
-            "theme": "cl",
-            "sessionSource": "MDX_SESSION_SOURCE_UNKNOWN",
-            "connectParams": '{"setStatesParams": "{"playbackSpeed":0}"}',
-            "RID": "1",
-            "CVER": "1",
-            "capabilities": "que,dsdtr,atp,vsp",
-            "ui": "false",
-            "app": "ytios-phone-20.15.1",
-            "pairing_type": "manual",
-            "VER": "8",
-            "loungeIdToken": self.auth.lounge_id_token,
-            "device": "REMOTE_CONTROL",
-            "name": self.device_name,
-        }
-        connect_url = f"{api_base}/bc/bind"
-        async with (
-            asyncio.timeout(_REQUEST_TIMEOUT),
-            self._required_session.post(url=connect_url, data=connect_body) as resp,
-        ):
-            try:
-                text = await resp.text()
-                self.logger.debug("YouTube Lounge connection response: HTTP %s", resp.status)
-                if resp.status == 401:
-                    self._lounge_token_expired()
-                    return False
-
-                if resp.status != 200:
-                    self._logger.warning("Unknown reply to connect %i %s", resp.status, resp.reason)
-                    return False
-                lines = text.splitlines()
-                async for events in self._parse_event_chunks(as_aiter(lines)):
-                    await self._process_events(events)
-                self._command_offset = 1
-                return self.connected()
-            except Exception:
-                self._logger.exception(
-                    "Handle connect failed, status %s reason %s",
-                    resp.status,
-                    resp.reason,
-                )
-                raise
+                connect_body = {
+                    "id": self.auth.device_id,
+                    "mdx-version": "3",
+                    "TYPE": "xmlhttp",
+                    "theme": "cl",
+                    "sessionSource": "MDX_SESSION_SOURCE_UNKNOWN",
+                    "RID": "1",
+                    "CVER": "1",
+                    "capabilities": "que,dsdtr,atp,vsp",
+                    "ui": "false",
+                    "app": "ytios-phone-20.15.1",
+                    "pairing_type": "manual",
+                    "VER": "8",
+                    "loungeIdToken": self.auth.lounge_id_token,
+                    "device": "REMOTE_CONTROL",
+                    "name": self.device_name,
+                }
+                async with self._required_session.post(
+                    url=f"{api_base}/bc/bind", data=connect_body
+                ) as response:
+                    text = await response.text()
+                    self.logger.debug(
+                        "YouTube Lounge connection response: HTTP %s (profile=mobile)",
+                        response.status,
+                    )
+                    if response.status == 401:
+                        self._lounge_token_expired()
+                        return False
+                    if response.status != 200:
+                        return False
+                    async for events in self._parse_event_chunks(as_aiter(text.splitlines())):
+                        await self._process_events(events)
+                    return self.connected()
+        except (Exception, asyncio.CancelledError) as err:
+            self._connection_lost()
+            self.logger.debug(
+                "YouTube Lounge connection failed (profile=%s, error=%s)",
+                profile,
+                type(err).__name__,
+            )
+            raise

@@ -81,7 +81,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(
     if duration is not None:
         sample["duration"] = duration
 
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             await client._process_event("nowPlaying", [sample])
             await asyncio.gather(*tv._scheduler._tasks)
@@ -115,7 +115,7 @@ async def test_short_video_dismissal_uses_this_tvs_options(
 async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
     tv = _playback_runtime(hass)
     client = tv._client
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             await client._process_event(
                 "nowPlaying",
@@ -132,11 +132,68 @@ async def test_ad_duration_does_not_trigger_short_video_dismissal(hass):
     assert tv.snapshot.last_short_disruption is None
 
 
+@pytest.mark.parametrize("first_event", ["onStateChange", "nowPlaying"])
+async def test_midroll_duration_from_debug_log_does_not_dismiss_content(hass, first_event):
+    tv = _playback_runtime(hass)
+    client = tv._client
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
+        try:
+            await client._process_event(
+                "nowPlaying",
+                [
+                    {
+                        "videoId": "long-video",
+                        "state": "1",
+                        "currentTime": "358.901",
+                        "duration": "1364.521",
+                    }
+                ],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            ad_update = {"state": "1", "currentTime": "0", "duration": "14"}
+            if first_event == "nowPlaying":
+                ad_update["videoId"] = "long-video"
+            await client._process_event(first_event, [ad_update])
+            await asyncio.gather(*tv._scheduler._tasks)
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "long-video", "state": "1", "currentTime": "0", "duration": "14.301"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            command.assert_not_awaited()
+            assert client.ad_playing is True
+            assert tv.snapshot.last_short_disruption is None
+
+            await client._process_event(
+                "nowPlaying",
+                [
+                    {
+                        "videoId": "long-video",
+                        "state": "1",
+                        "currentTime": "385",
+                        "duration": "1364.521",
+                    }
+                ],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            assert client.ad_playing is False
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "actual-short", "state": "1", "currentTime": "0", "duration": "14"}],
+            )
+            await asyncio.gather(*tv._scheduler._tasks)
+            command.assert_awaited_once_with("dpadCommand", {"key": "BACK"})
+            assert tv.snapshot.last_short_disruption is not None
+        finally:
+            await tv._scheduler.cancel()
+            await client.stop_subscription()
+
+
 @pytest.mark.parametrize("change", ["different video", "switch off"])
 async def test_queued_short_dismissal_rechecks_playback_or_switch_state(hass, change):
     tv = _playback_runtime(hass)
     client = tv._client
-    with patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command:
+    with patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command:
         try:
             async with client._command_mutex:
                 await client._process_event(
@@ -206,7 +263,7 @@ async def test_blocked_channel_dismisses_once_without_sponsorblock_or_duration(h
             new_callable=AsyncMock,
             return_value=BLOCKED_CHANNEL,
         ) as lookup,
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             await client._process_event("nowPlaying", [{"videoId": "video", "state": "1"}])
@@ -241,7 +298,7 @@ async def test_channel_dismissal_rechecks_playback_after_waiting_for_command_loc
             return_value=BLOCKED_CHANNEL,
         ),
         patch.object(client, "press_back", side_effect=observe_back),
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             async with client._command_mutex:
@@ -281,7 +338,7 @@ async def test_channel_lookup_retries_after_failure_while_sponsorblock_continues
             client.api_helper, "get_segments", new_callable=AsyncMock, return_value=[segment]
         ) as segments,
         patch.object(client.api_helper, "mark_viewed_segments") as mark_viewed,
-        patch.object(pyytlounge.YtLoungeApi, "_command", return_value=True) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=True) as command,
     ):
         try:
             await client._process_event(
@@ -337,8 +394,8 @@ async def test_integration_debug_logging_traces_ad_skip_and_shorts(
     )
 
     with patch.object(
-        pyytlounge.YtLoungeApi,
-        "_command",
+        runtime.YtLoungeApi,
+        "_send_command",
         side_effect=[True, ClientError("https://example.com/?token=private-lounge-token")],
     ) as command:
         await client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
@@ -454,7 +511,7 @@ async def test_screen_disconnect_sends_one_back_on_timely_reconnect(
         patch.object(client, "connect", side_effect=connect),
         patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
         patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
-        patch.object(pyytlounge.YtLoungeApi, "_command", side_effect=send_command) as command,
+        patch.object(runtime.YtLoungeApi, "_send_command", side_effect=send_command) as command,
     ):
         tv.async_start()
         try:
@@ -532,6 +589,241 @@ async def test_temporary_failure_and_offline_tv_do_not_start_repair(hass):
     assert tv.snapshot.pairing_problem is False
     assert not tv.snapshot.connected
     assert not list(entry.async_get_active_flows(hass, {SOURCE_REAUTH}))
+
+
+async def test_disconnect_without_reason_retries_immediately_once_without_back(hass):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    backing_off = asyncio.Event()
+
+    async def connect():
+        client._sid = client._gsession = "connected"
+        return True
+
+    async def subscribe():
+        await client._process_event("loungeScreenDisconnected", [])
+
+    def record_retry(message, *args):
+        if message == "Retrying YouTube Lounge connection in %s s":
+            backing_off.set()
+
+    with (
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect) as bind,
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(runtime.YtLoungeApi, "_send_command") as command,
+        patch.object(tv._logger, "debug", side_effect=record_retry),
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(backing_off.wait(), timeout=2)
+        finally:
+            await tv.async_stop()
+
+    assert bind.await_count == 2
+    command.assert_not_awaited()
+    assert tv.snapshot.last_short_disruption is None
+
+
+@pytest.mark.parametrize("ad_event", ["adPlaying", "onAdStateChange"])
+async def test_unanswered_queries_keep_fallback_live_and_accept_late_ad_events(hass, ad_event):
+    tv = runtime.TVRuntime(
+        hass, _entry(hass), None, {**DEFAULT_OPTIONS, "skip_ads": True, "skip_categories": []}
+    )
+    client = tv._client
+    client._request_initial_playback = True
+    profiles = []
+    fallback_queried = asyncio.Event()
+    release_playback = asyncio.Event()
+    ad_received = asyncio.Event()
+    recovered_again = asyncio.Event()
+
+    async def connect():
+        profiles.append(client.use_web_binding)
+        client._sid = client._gsession = f"session-{len(profiles)}"
+        return True
+
+    async def subscribe():
+        if len(profiles) == 2:
+            await release_playback.wait()
+            await client._process_event(
+                "nowPlaying",
+                [{"videoId": "content", "state": "1", "currentTime": "20", "duration": "100"}],
+            )
+            if ad_event == "adPlaying":
+                payload = {"contentVideoId": "content", "isSkipEnabled": "true"}
+            else:
+                payload = {"adState": "1", "currentTime": "0", "isSkipEnabled": "true"}
+            await client._process_event(ad_event, [payload])
+            await asyncio.gather(*client._actions)
+            ad_received.set()
+        elif len(profiles) == 3:
+            recovered_again.set()
+        await asyncio.Future()
+
+    async def send(command, _parameters):
+        if command == "getNowPlaying" and len(profiles) == 2:
+            fallback_queried.set()
+        return True
+
+    async def wait_for_expired_query():
+        while client._playback_request_at is not None:
+            await asyncio.sleep(0)
+
+    with (
+        patch.object(ytlounge, "_PLAYBACK_REPLY_TIMEOUT", 0),
+        patch.object(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect) as bind,
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
+        patch.object(client, "_send_command", side_effect=send) as command,
+        patch.object(hass.config_entries, "async_schedule_reload") as reload,
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(fallback_queried.wait(), timeout=2)
+            await asyncio.wait_for(wait_for_expired_query(), timeout=2)
+            assert profiles == [False, True]
+            assert tv.snapshot.connected
+            assert tv._task is not None and not tv._task.done()
+            release_playback.set()
+            await asyncio.wait_for(ad_received.wait(), timeout=2)
+            assert tv.snapshot.video_id == "content"
+            assert tv.snapshot.playback_state == "playing"
+            assert tv.snapshot.ad_playing
+            assert tv.snapshot.ad_skippable
+            assert call("skipAd", None) in command.await_args_list
+            reload.assert_not_called()
+
+            # Real playback rearms recovery and permits switching back to the primary profile.
+            await client.get_now_playing()
+            await asyncio.wait_for(recovered_again.wait(), timeout=2)
+            assert profiles == [False, True, False]
+            assert bind.await_count == 3
+        finally:
+            await tv.async_stop()
+
+    assert tv.snapshot.last_short_disruption is None
+
+
+async def test_failed_alternate_binding_returns_to_last_successful_profile(hass):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    client._request_initial_playback = True
+    profiles = []
+    restored = asyncio.Event()
+
+    async def connect():
+        profiles.append(client.use_web_binding)
+        if len(profiles) == 2:
+            return False
+        client._sid = client._gsession = f"session-{len(profiles)}"
+        return True
+
+    async def subscribe():
+        if len(profiles) == 3:
+            restored.set()
+        await asyncio.Future()
+
+    with (
+        patch.object(runtime, "RETRY_INTERVAL", 0),
+        patch.object(ytlounge, "_PLAYBACK_REPLY_TIMEOUT", 0),
+        patch.object(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect),
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
+        patch.object(client, "_send_command", return_value=True),
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(restored.wait(), timeout=2)
+            assert profiles == [False, True, False]
+            assert tv.snapshot.connected
+        finally:
+            await tv.async_stop()
+
+
+async def test_receiver_absent_keeps_original_subscription_for_late_playback(hass):
+    tv = runtime.TVRuntime(hass, _entry(hass), None, DEFAULT_OPTIONS)
+    client = tv._client
+    client._request_initial_playback = True
+    absent_seen = asyncio.Event()
+    release_receiver = asyncio.Event()
+    playback_received = asyncio.Event()
+    profiles = []
+
+    async def connect():
+        profiles.append(client.use_web_binding)
+        client._sid = client._gsession = "connected"
+        return True
+
+    async def subscribe():
+        await client._process_event("loungeStatus", [{"devices": "[]"}])
+        absent_seen.set()
+        await release_receiver.wait()
+        await client._process_event(
+            "loungeStatus",
+            [{"devices": '[{"type":"LOUNGE_SCREEN","name":"Test","deviceInfo":"{}"}]'}],
+        )
+        await client._process_event(
+            "nowPlaying",
+            [{"videoId": "content", "state": "1", "currentTime": "20", "duration": "100"}],
+        )
+        playback_received.set()
+        await asyncio.Future()
+
+    async def wait_for_expired_query():
+        while client._playback_request_at is not None:
+            await asyncio.sleep(0)
+
+    with (
+        patch.object(ytlounge, "_PLAYBACK_REPLY_TIMEOUT", 0),
+        patch.object(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0),
+        patch.object(
+            runtime,
+            "async_verify_screen_id",
+            return_value=PairedScreen(screen_id=SCREEN_ID, name=None, lounge_token="test-token"),
+        ),
+        patch.object(client, "is_available", return_value=True),
+        patch.object(client, "connect", side_effect=connect),
+        patch.object(pyytlounge.YtLoungeApi, "subscribe", side_effect=subscribe),
+        patch.object(pyytlounge.YtLoungeApi, "disconnect", return_value=True),
+        patch.object(client, "_send_command", return_value=True),
+        patch.object(client.api_helper, "get_segments", new_callable=AsyncMock, return_value=[]),
+    ):
+        tv.async_start()
+        try:
+            await asyncio.wait_for(absent_seen.wait(), timeout=2)
+            await client.get_now_playing()
+            await asyncio.wait_for(wait_for_expired_query(), timeout=2)
+            assert client.receiver_present is False
+            assert profiles == [False]
+            assert tv.snapshot.connected
+            release_receiver.set()
+            await asyncio.wait_for(playback_received.wait(), timeout=2)
+            assert client.receiver_present is True
+            assert profiles == [False]
+            assert tv.snapshot.video_id == "content"
+            assert tv.snapshot.playback_state == "playing"
+        finally:
+            await tv.async_stop()
 
 
 @pytest.mark.parametrize(

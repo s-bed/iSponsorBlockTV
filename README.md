@@ -56,12 +56,22 @@ TV code. **Reconfigure** on the TV's integration entry also lets you re-pair it.
 
 ## Playback and entities
 
-The TV exposes connection and pairing status, playback and ad state, and
-SponsorBlock skip activity. **Lifetime SponsorBlock skips** and **Last
-SponsorBlock skip** are saved per TV across restarts and reloads, independently
-of Home Assistant Recorder. Totals start at zero when upgrading from the
-session-only counter. Additional video and audio sensors can be enabled from the
-device page.
+**Lifetime SponsorBlock skips** and **Last SponsorBlock skip** track seeks past
+community-marked segments inside videos. **Lifetime YouTube ad skips** and
+**Last YouTube ad skip** update once per ad when YouTube acknowledges the
+integration's skip command or the five-second workaround's content reload.
+The ad count starts at zero when this feature is installed.
+
+Both counts and timestamps are saved per TV across restarts and reloads,
+independently of Home Assistant Recorder. SponsorBlock totals start at zero
+when upgrading from the session-only counter. Additional video and audio
+sensors can be enabled from the device page.
+
+With **Skip YouTube ads when possible** enabled, the integration skips ads as
+soon as YouTube allows it. For an explicitly non-skippable ad, it pauses the ad,
+shows a five-second countdown toast, and reloads the content at its saved
+position. It corrects the position once playback resumes if needed. YouTube
+controls how the toast appears on the TV.
 
 Each TV has an **Interrupt short videos** switch in the **Configuration**
 section of its Home Assistant device page. It is on by default. Turn it off to
@@ -73,6 +83,10 @@ iSponsorBlockTV sends a Back command to dismiss videos shorter than the
 configured threshold (30 seconds by default). This also applies to regular
 videos under the threshold. Videos at or above the threshold and ads are
 excluded.
+
+A sudden duration drop below half of the known content duration for the same
+video is treated as an ad transition. This prevents short ad durations from
+triggering the Shorts rule before YouTube reports that an ad is playing.
 
 YouTube can show the Shorts connection warning before it reports a video's
 duration. With **Interrupt short videos** on, iSponsorBlockTV sends Back once
@@ -118,6 +132,23 @@ for `custom_components.isponsorblocktv` and your TV's integration name.
 The log shows what playback state YouTube reported after a `skipAd` or `seekTo`
 request and whether YouTube acknowledged it. An acknowledgment confirms the
 request was accepted. The following playback events show what the TV did.
+
+For a disconnect, look for `Sending YouTube Lounge keepalive` and the following
+`getNowPlaying` acknowledgment. The integration sends this request after about
+a minute without a Lounge command while the TV is connected.
+
+Look for `YouTube receiver presence changed` to see whether the TV app joined
+the Lounge session. When it joins, the integration asks for its current playback
+if the TV has not already reported it. If a request goes unanswered for 15
+seconds, the integration can try the other Lounge client profile (mobile or web)
+once. If neither receives a playback update, the listener stays open for late
+reports and continues its periodic checks. Another profile change is possible
+after the TV reports playback or an ad. Live entities can show **Unknown** while
+waiting for their first report and **Unavailable** while disconnected.
+
+For the five-second ad workaround, look for `Pausing non-skippable YouTube ad`
+and `Reloaded content after non-skippable YouTube ad`. The pause entry includes
+the saved content position and remaining countdown.
 
 For a Shorts interruption, find `YouTube Shorts Back result` near the **Last
 YouTube Shorts disruption** timestamp. The trigger shows which rule sent Back.

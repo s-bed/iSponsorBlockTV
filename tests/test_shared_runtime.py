@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pyytlounge
+from custom_components.isponsorblocktv.core import ytlounge
 from custom_components.isponsorblocktv.core.playback import PlaybackScheduler
 from custom_components.isponsorblocktv.core.ytlounge import YtLoungeApi
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -117,9 +118,14 @@ async def test_ad_mute_restored_on_disconnect_and_prefetch_still_runs(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_subscription_cancellation_releases_tasks_without_closing_session(hass, monkeypatch):
+@pytest.mark.parametrize("keepalive", [False, True])
+async def test_subscription_cancellation_releases_tasks_without_closing_session(
+    hass, monkeypatch, keepalive
+):
     started = asyncio.Event()
     stopped = asyncio.Event()
+    keepalive_started = asyncio.Event()
+    keepalive_stopped = asyncio.Event()
 
     async def subscribe(_):
         started.set()
@@ -128,17 +134,95 @@ async def test_subscription_cancellation_releases_tasks_without_closing_session(
         finally:
             stopped.set()
 
+    async def send_command(_client, command, parameters):
+        keepalive_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            keepalive_stopped.set()
+
     monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", send_command)
     session = async_get_clientsession(hass)
     client = YtLoungeApi(web_session=session)
+    if keepalive:
+        client._sid = client._gsession = "connected"
+        client._last_command_at = asyncio.get_running_loop().time() - 61
     task = asyncio.create_task(client.run_subscription(AsyncMock()))
     await asyncio.wait_for(started.wait(), timeout=1)
+    if keepalive:
+        await asyncio.wait_for(keepalive_started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert stopped.is_set()
     assert client._subscription is client._watchdog_task is None
+    assert keepalive_stopped.is_set() == keepalive
     assert not session.closed
+
+
+@pytest.mark.asyncio
+async def test_subscription_queries_playback_after_a_minute_without_commands(monkeypatch, caplog):
+    client = YtLoungeApi()
+    client._sid = client._gsession = "connected"
+    sent = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    elapsed = 0
+
+    async def subscribe(_client):
+        await asyncio.Future()
+
+    async def send_command(_client, command, parameters):
+        sent.put_nowait((command, parameters))
+        return True
+
+    monkeypatch.setattr(loop, "time", lambda: real_time() + elapsed)
+    monkeypatch.setattr(ytlounge, "_WATCHDOG_POLL_INTERVAL", 0)
+    monkeypatch.setattr(pyytlounge.YtLoungeApi, "subscribe", subscribe)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", send_command)
+    caplog.set_level(logging.DEBUG, logger=client.logger.name)
+
+    task = asyncio.create_task(client.run_subscription(AsyncMock()))
+    try:
+        await asyncio.sleep(0)
+        elapsed = 50
+        await client.set_volume(42)
+        assert sent.get_nowait() == ("setVolume", {"volume": 42})
+
+        # A regular command postpones the keepalive even if the stream has been open a minute.
+        elapsed = 70
+        await client._process_event("noop", [])
+        await asyncio.sleep(0)
+        await asyncio.gather(*client._actions)
+        assert sent.empty()
+
+        elapsed = 111
+        await client._process_event("noop", [])
+        assert await asyncio.wait_for(sent.get(), timeout=1) == ("getNowPlaying", None)
+        assert "Sending YouTube Lounge keepalive" in caplog.text
+        assert "YouTube Lounge command getNowPlaying acknowledged=True" in caplog.text
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_keepalive_is_skipped_after_a_recent_command(monkeypatch):
+    client = YtLoungeApi()
+    client._sid = client._gsession = "connected"
+    command = AsyncMock(return_value=True)
+    monkeypatch.setattr(YtLoungeApi, "_send_command", command)
+
+    async with client._command_mutex:
+        volume = asyncio.create_task(client.set_volume(42))
+        keepalive = asyncio.create_task(
+            client._send_keepalive(asyncio.get_running_loop().time() - 61)
+        )
+        await asyncio.sleep(0)
+    await asyncio.gather(volume, keepalive)
+
+    command.assert_awaited_once_with("setVolume", {"volume": 42})
 
 
 @pytest.mark.asyncio

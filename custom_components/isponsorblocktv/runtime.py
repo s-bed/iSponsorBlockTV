@@ -21,7 +21,7 @@ from .const import CONF_DISTURB_SHORT_VIDEOS, CONF_SCREEN_ID, DOMAIN
 from .core.api_helpers import ApiHelper
 from .core.pairing import PairingRejected, PairingUnavailable, async_verify_screen_id
 from .core.playback import PlaybackScheduler
-from .core.ytlounge import YtLoungeApi
+from .core.ytlounge import PlaybackResponseTimeout, YtLoungeApi
 
 AUTH_CHECK_INTERVAL = 15 * 60
 RETRY_INTERVAL = 10
@@ -46,6 +46,8 @@ class PlaybackActivity(TypedDict):
 
     count: int
     last_skip: str | None
+    ad_skip_count: NotRequired[int]
+    last_ad_skip: NotRequired[str | None]
     last_short_disruption: NotRequired[str | None]
 
 
@@ -66,6 +68,8 @@ class TVSnapshot:
     ad_skippable: bool | None = None
     skip_count: int = 0
     last_skip: datetime | None = None
+    ad_skip_count: int = 0
+    last_ad_skip: datetime | None = None
     last_short_disruption: datetime | None = None
     video_id: str | None = None
     duration: float | None = None
@@ -116,6 +120,7 @@ class TVRuntime:
             self._logger,
             web_session=session,
             on_update=self._async_lounge_updated,
+            on_ad_skip=self._async_ad_skipped,
             request_initial_playback=bool(blocked_channels),
         )
         self._scheduler = PlaybackScheduler(
@@ -148,11 +153,14 @@ class TVRuntime:
         """Load saved playback activity before exposing the sensors."""
         if (activity := await self._activity_store.async_load()) is not None:
             last_skip = activity["last_skip"]
+            last_ad_skip = activity.get("last_ad_skip")
             last_short_disruption = activity.get("last_short_disruption")
             self.snapshot = replace(
                 self.snapshot,
                 skip_count=activity["count"],
                 last_skip=datetime.fromisoformat(last_skip) if last_skip else None,
+                ad_skip_count=activity.get("ad_skip_count", 0),
+                last_ad_skip=datetime.fromisoformat(last_ad_skip) if last_ad_skip else None,
                 last_short_disruption=(
                     datetime.fromisoformat(last_short_disruption) if last_short_disruption else None
                 ),
@@ -213,6 +221,13 @@ class TVRuntime:
         self._async_save_activity()
 
     @callback
+    def _async_ad_skipped(self) -> None:
+        self._async_publish(
+            ad_skip_count=self.snapshot.ad_skip_count + 1, last_ad_skip=datetime.now(UTC)
+        )
+        self._async_save_activity()
+
+    @callback
     def _async_short_disrupted(self) -> None:
         self._async_publish(last_short_disruption=datetime.now(UTC))
         self._async_save_activity()
@@ -225,10 +240,13 @@ class TVRuntime:
     @callback
     def _activity_data(self) -> PlaybackActivity:
         last_skip = self.snapshot.last_skip
+        last_ad_skip = self.snapshot.last_ad_skip
         last_short_disruption = self.snapshot.last_short_disruption
         return {
             "count": self.snapshot.skip_count,
             "last_skip": last_skip.isoformat() if last_skip else None,
+            "ad_skip_count": self.snapshot.ad_skip_count,
+            "last_ad_skip": last_ad_skip.isoformat() if last_ad_skip else None,
             "last_short_disruption": (
                 last_short_disruption.isoformat() if last_short_disruption else None
             ),
@@ -254,13 +272,18 @@ class TVRuntime:
             await self._async_cleanup(terminate=True)
 
     async def _async_connect_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_immediate_retry = loop.time()
         retry = RETRY_INTERVAL
+        trying_other_binding = False
         while True:
+            retry_promptly = False
             try:
                 self._client.auth.lounge_id_token = await self._async_verify()
                 if not await self._client.is_available():
                     self._logger.debug("YouTube screen is unavailable")
                 elif await self._client.connect():
+                    trying_other_binding = False
                     self._logger.debug(
                         "Connected to YouTube Lounge (skip ads=%s, mute ads=%s)",
                         self._client.skip_ads,
@@ -272,6 +295,16 @@ class TVRuntime:
                     self._async_publish(connected=True)
                     self._async_lounge_updated()
                     await self._async_listen()
+                    retry_promptly = self._client.screen_disconnected_without_reason
+            except PlaybackResponseTimeout:
+                await self._async_cleanup()
+                self._client.use_web_binding = not self._client.use_web_binding
+                trying_other_binding = True
+                self._logger.debug(
+                    "Trying the %s Lounge client after an unanswered playback request",
+                    "web" if self._client.use_web_binding else "mobile",
+                )
+                continue
             except PairingRejected:
                 self._logger.debug("YouTube rejected the saved pairing (%s)", self._rejections)
                 if self._rejections >= 2:
@@ -284,6 +317,15 @@ class TVRuntime:
                 self._logger.debug("YouTube connection failed (%s)", type(err).__name__)
 
             await self._async_cleanup()
+            if trying_other_binding:
+                # The alternate client could not connect. Return to the last usable binding.
+                self._client.use_web_binding = not self._client.use_web_binding
+                trying_other_binding = False
+            if retry_promptly and (now := loop.time()) >= next_immediate_retry:
+                # Rate-limit the immediate retry in case the screen keeps dropping the session.
+                next_immediate_retry = now + RETRY_INTERVAL
+                self._logger.debug("Reconnecting to YouTube Lounge promptly")
+                continue
             self._logger.debug("Retrying YouTube Lounge connection in %s s", retry)
             await asyncio.sleep(retry)
             retry = min(retry * 2, MAX_RETRY_INTERVAL)
@@ -331,6 +373,8 @@ class TVRuntime:
                 try:
                     if await subscription:
                         retries = 0
+                except PlaybackResponseTimeout:
+                    raise
                 except (ClientError, TimeoutError) as err:
                     self._logger.debug(
                         "YouTube Lounge event stream failed (%s)", type(err).__name__

@@ -88,6 +88,7 @@
         "data_description": {
           "skip_categories": "Clear all categories to disable SponsorBlock skipping on this TV.",
           "offset": "Use a positive value to send the seek command earlier.",
+          "skip_ads": "Skip ads as soon as YouTube allows it. For non-skippable ads, pause the ad and reload the video at its saved position after a five-second countdown.",
           "disturb_short_videos": "Interrupt all videos shorter than the threshold, including regular videos. Also send Back after reconnecting from a recent TV-initiated user disconnect.",
           "short_video_duration_threshold": "Compare this threshold with the duration reported by the YouTube app."
         },
@@ -194,6 +195,8 @@
       },
       "skip_count": {"name": "Lifetime SponsorBlock skips"},
       "last_skip": {"name": "Last SponsorBlock skip"},
+      "ad_skip_count": {"name": "Lifetime YouTube ad skips"},
+      "last_ad_skip": {"name": "Last YouTube ad skip"},
       "last_short_disruption": {"name": "Last YouTube Shorts disruption"},
       "video_id": {"name": "Video ID"},
       "duration": {"name": "Video duration"},

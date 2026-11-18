@@ -27,6 +27,12 @@ SENSORS = (
         translation_key="last_skip",
         device_class=SensorDeviceClass.TIMESTAMP,
     ),
+    SensorEntityDescription(key="ad_skip_count", translation_key="ad_skip_count"),
+    SensorEntityDescription(
+        key="last_ad_skip",
+        translation_key="last_ad_skip",
+        device_class=SensorDeviceClass.TIMESTAMP,
+    ),
     SensorEntityDescription(
         key="last_short_disruption",
         translation_key="last_short_disruption",
@@ -74,6 +80,8 @@ class ISponsorBlockTVSensor(ISponsorBlockTVEntity, SensorEntity):
         requires_connection = description.key not in {
             "skip_count",
             "last_skip",
+            "ad_skip_count",
+            "last_ad_skip",
             "last_short_disruption",
         }
         super().__init__(entry, description, requires_connection=requires_connection)

@@ -44,6 +44,8 @@ def entry() -> MockConfigEntry:
             playback_state="playing",
             skip_count=3,
             last_skip=datetime(2026, 11, 8, tzinfo=UTC),
+            ad_skip_count=2,
+            last_ad_skip=datetime(2026, 11, 10, tzinfo=UTC),
             last_short_disruption=datetime(2026, 11, 9, tzinfo=UTC),
             video_id="dQw4w9WgXcQ",
             duration=213.5,
@@ -69,6 +71,8 @@ async def test_sensors(hass: HomeAssistant, entry: MockConfigEntry) -> None:
         "playback_state": "playing",
         "skip_count": 3,
         "last_skip": entry.runtime_data.snapshot.last_skip,
+        "ad_skip_count": 2,
+        "last_ad_skip": entry.runtime_data.snapshot.last_ad_skip,
         "last_short_disruption": entry.runtime_data.snapshot.last_short_disruption,
         "video_id": "dQw4w9WgXcQ",
         "duration": 213.5,
@@ -77,6 +81,7 @@ async def test_sensors(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     }
     assert sensors["playback_state"].device_class == SensorDeviceClass.ENUM
     assert sensors["last_skip"].device_class == SensorDeviceClass.TIMESTAMP
+    assert sensors["last_ad_skip"].device_class == SensorDeviceClass.TIMESTAMP
     assert sensors["last_short_disruption"].device_class == SensorDeviceClass.TIMESTAMP
     assert sensors["duration"].native_unit_of_measurement == UnitOfTime.SECONDS
     assert sensors["volume"].native_unit_of_measurement == PERCENTAGE
@@ -84,6 +89,8 @@ async def test_sensors(hass: HomeAssistant, entry: MockConfigEntry) -> None:
         "playback_state",
         "skip_count",
         "last_skip",
+        "ad_skip_count",
+        "last_ad_skip",
         "last_short_disruption",
     }
 
@@ -91,6 +98,8 @@ async def test_sensors(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     assert {key for key, entity in sensors.items() if entity.available} == {
         "skip_count",
         "last_skip",
+        "ad_skip_count",
+        "last_ad_skip",
         "last_short_disruption",
     }
 
@@ -181,7 +190,7 @@ async def test_packaged_entry_registers_device_and_entities(hass: HomeAssistant)
             entity.unique_id.removeprefix(f"{entry.entry_id}_"): entity
             for entity in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
         }
-        assert len(registered) == 14
+        assert len(registered) == 16
         assert all(entity.device_id == device.id for entity in registered.values())
         assert {key for key, entity in registered.items() if entity.disabled} == {
             "video_id",
@@ -256,6 +265,91 @@ async def test_shorts_switch_saves_each_tvs_preference_without_reloading(
         )
         assert hass.states.get(entity_id).state == STATE_ON
         assert entry.options["disturb_short_videos"] is True
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        assert await hass.config_entries.async_unload(other.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged", [True, False])
+async def test_youtube_ad_activity_survives_reload_separately_from_sponsorblock(
+    hass: HomeAssistant, acknowledged: bool
+) -> None:
+    """Count a real native ad command and migrate old activity records per TV."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Living Room",
+        data={CONF_SCREEN_ID: "living"},
+        options={"skip_ads": True},
+    )
+    other = MockConfigEntry(domain=DOMAIN, title="Bedroom", data={CONF_SCREEN_ID: "bedroom"})
+    entry.add_to_hass(hass)
+    other.add_to_hass(hass)
+    saved_skip = datetime(2026, 11, 8, tzinfo=UTC)
+    store = runtime.activity_store(hass, entry.entry_id)
+    await store.async_save({"count": 4, "last_skip": saved_skip.isoformat()})
+
+    with (
+        patch.object(runtime.TVRuntime, "async_start"),
+        patch.object(runtime.YtLoungeApi, "_send_command", return_value=acknowledged) as command,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert other.state is ConfigEntryState.LOADED
+        registry = er.async_get(hass)
+        entities = {
+            key: registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_{key}")
+            for key in ("ad_skip_count", "last_ad_skip", "skip_count", "last_skip")
+        }
+        other_entities = {
+            key: registry.async_get_entity_id("sensor", DOMAIN, f"{other.entry_id}_{key}")
+            for key in ("ad_skip_count", "last_ad_skip")
+        }
+        assert all(entities.values())
+        assert all(other_entities.values())
+        assert hass.states.get(entities["ad_skip_count"]).state == "0"
+        assert hass.states.get(entities["last_ad_skip"]).state == STATE_UNKNOWN
+        assert hass.states.get(entities["skip_count"]).state == "4"
+        assert hass.states.get(entities["last_skip"]).state == saved_skip.isoformat(
+            timespec="seconds"
+        )
+
+        tv = entry.runtime_data
+        tv._client._sid = tv._client._gsession = "connected"
+        tv._async_publish(connected=True)
+        await tv._client._process_event("adPlaying", [{"isSkipEnabled": "true"}])
+        await asyncio.gather(*tv._client._actions)
+        command.assert_awaited_once_with("skipAd", None)
+        skip_time = tv.snapshot.last_ad_skip
+        if acknowledged:
+            assert skip_time is not None and skip_time.tzinfo is UTC
+        else:
+            assert skip_time is None
+        expected_time = skip_time.isoformat(timespec="seconds") if skip_time else STATE_UNKNOWN
+        tv._async_publish(connected=False)
+        assert hass.states.get(entities["ad_skip_count"]).state == str(int(acknowledged))
+        assert hass.states.get(entities["last_ad_skip"]).state == expected_time
+        assert hass.states.get(entities["skip_count"]).state == "4"
+        assert tv.snapshot.last_skip == saved_skip
+        assert hass.states.get(other_entities["ad_skip_count"]).state == "0"
+        assert hass.states.get(other_entities["last_ad_skip"]).state == STATE_UNKNOWN
+
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data is not tv
+        assert hass.states.get(entities["ad_skip_count"]).state == str(int(acknowledged))
+        assert hass.states.get(entities["last_ad_skip"]).state == expected_time
+        assert entry.runtime_data.snapshot.last_ad_skip == skip_time
+        assert hass.states.get(entities["skip_count"]).state == "4"
+        assert hass.states.get(entities["last_skip"]).state == saved_skip.isoformat(
+            timespec="seconds"
+        )
+        assert other.runtime_data.snapshot.ad_skip_count == 0
+        assert other.runtime_data.snapshot.last_ad_skip is None
+        if acknowledged:
+            activity = await store.async_load()
+            assert activity["ad_skip_count"] == 1
+            assert activity["last_ad_skip"] == skip_time.isoformat()
         assert await hass.config_entries.async_unload(entry.entry_id)
         assert await hass.config_entries.async_unload(other.entry_id)
 
