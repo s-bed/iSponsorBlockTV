@@ -165,6 +165,7 @@ class AdReplay:
             await asyncio.sleep(wait)
             if not self._same_ad(video_id, generation):
                 return
+            attempt = self._client._ad_skip_attempt
             self._pending_seek = (video_id, position, generation)
             loaded = await self._client._command(
                 "setPlaylist",
@@ -175,6 +176,7 @@ class AdReplay:
                 self._pending_seek = None
             else:
                 self._paused = False
+                self._client._record_ad_skip(attempt)
                 self._client.logger.debug("Reloaded content after non-skippable YouTube ad")
         except Exception as err:  # noqa: BLE001
             self._pending_seek = None

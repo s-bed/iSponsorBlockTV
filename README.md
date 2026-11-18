@@ -56,12 +56,16 @@ TV code. **Reconfigure** on the TV's integration entry also lets you re-pair it.
 
 ## Playback and entities
 
-The TV exposes connection and pairing status, playback and ad state, and
-SponsorBlock skip activity. **Lifetime SponsorBlock skips** and **Last
-SponsorBlock skip** are saved per TV across restarts and reloads, independently
-of Home Assistant Recorder. Totals start at zero when upgrading from the
-session-only counter. Additional video and audio sensors can be enabled from the
-device page.
+**Lifetime SponsorBlock skips** and **Last SponsorBlock skip** track seeks past
+community-marked segments inside videos. **Lifetime YouTube ad skips** and
+**Last YouTube ad skip** update once per ad when YouTube acknowledges the
+integration's skip command or the five-second workaround's content reload.
+The ad count starts at zero when this feature is installed.
+
+Both counts and timestamps are saved per TV across restarts and reloads,
+independently of Home Assistant Recorder. SponsorBlock totals start at zero
+when upgrading from the session-only counter. Additional video and audio
+sensors can be enabled from the device page.
 
 With **Skip YouTube ads when possible** enabled, the integration skips ads as
 soon as YouTube allows it. For an explicitly non-skippable ad, it pauses the ad,

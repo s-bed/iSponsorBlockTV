@@ -10,11 +10,11 @@ from custom_components.isponsorblocktv.core import ad_replay
 from custom_components.isponsorblocktv.core.ytlounge import YtLoungeApi
 
 
-def _client(**options):
+def _client(*, on_ad_skip=None, **options):
     config = SimpleNamespace(
         join_name="Test", mute_ads=False, skip_ads=True, auto_play=True, offset=0, **options
     )
-    client = YtLoungeApi(config=config)
+    client = YtLoungeApi(config=config, on_ad_skip=on_ad_skip)
     client._sid = client._gsession = "connected"
     return client
 
@@ -36,7 +36,8 @@ async def _content(client, **changes):
 
 @pytest.mark.asyncio
 async def test_non_skippable_ad_reloads_content_then_seeks_when_ready():
-    client = _client()
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     with (
         patch.object(ad_replay, "monotonic", return_value=100) as now,
         patch.object(ad_replay, "_AD_WAIT", 0),
@@ -57,6 +58,7 @@ async def test_non_skippable_ad_reloads_content_then_seeks_when_ready():
             call("pause", None),
             call("setPlaylist", {"videoId": "content", "currentTime": 360}),
         ]
+        counted.assert_called_once_with()
         await client._process_event("nowPlaying", [{}])
         await client._process_event(
             "nowPlaying",
@@ -65,12 +67,14 @@ async def test_non_skippable_ad_reloads_content_then_seeks_when_ready():
         await _content(client, currentTime="0")
         await asyncio.gather(*client._actions)
         commands.assert_awaited_once_with([("seekTo", {"newTime": 360})])
+        counted.assert_called_once_with()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["new_video", "ad_ended", "session_stopped"])
 async def test_countdown_is_cancelled_when_its_ad_is_no_longer_current(change):
-    client = _client()
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     paused = asyncio.Event()
 
     async def send(command, parameters):
@@ -99,6 +103,7 @@ async def test_countdown_is_cancelled_when_its_ad_is_no_longer_current(change):
         await asyncio.gather(task, *client._actions, return_exceptions=True)
 
     assert command.await_args_list == [call("pause", None)]
+    counted.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -148,7 +153,8 @@ async def test_explicit_ad_skipped_state_clears_inferred_ad_without_losing_conte
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [False, OSError("Request failed")])
 async def test_failed_skip_releases_pause_after_ad_becomes_skippable(failure):
-    client = _client()
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     paused = asyncio.Event()
 
     async def send(command, parameters):
@@ -173,6 +179,7 @@ async def test_failed_skip_releases_pause_after_ad_becomes_skippable(failure):
         )
         await asyncio.gather(task, *client._actions, return_exceptions=True)
     assert [item.args[0] for item in command.await_args_list] == ["pause", "skipAd", "play"]
+    counted.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -203,11 +210,13 @@ async def test_countdown_toast_terminates_its_remote_without_changing_main_sessi
 
 
 @pytest.mark.asyncio
-async def test_failed_reload_resumes_the_same_paused_ad():
-    client = _client()
+@pytest.mark.parametrize("failure", [False, OSError("Reload failed")])
+async def test_failed_reload_resumes_the_same_paused_ad(failure):
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     with (
         patch.object(ad_replay, "_AD_WAIT", 0),
-        patch.object(client, "_send_command", side_effect=[True, False, True]) as command,
+        patch.object(client, "_send_command", side_effect=[True, failure, True]) as command,
     ):
         await _content(client)
         await client._process_event(
@@ -216,12 +225,14 @@ async def test_failed_reload_resumes_the_same_paused_ad():
         await asyncio.gather(*client._actions)
     assert [item.args[0] for item in command.await_args_list] == ["pause", "setPlaylist", "play"]
     assert client._ad_replay._pending_seek is None
+    counted.assert_not_called()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owned_mute", [True, False])
 async def test_skippable_ad_restores_only_integration_owned_mute_in_one_batch(owned_mute):
-    client = _client()
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     client._muted_for_ad = owned_mute
     client.volume_state = {"volume": 42, "muted": "true"}
     with (
@@ -243,12 +254,14 @@ async def test_skippable_ad_restores_only_integration_owned_mute_in_one_batch(ow
         command.assert_awaited_once_with("skipAd", None)
         commands.assert_not_awaited()
     assert not client._muted_for_ad
+    counted.assert_called_once_with()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported_position", ["0", "350"])
 async def test_replay_restores_owned_mute_with_only_the_seek_needed(reported_position):
-    client = _client()
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
     client.volume_state = {"volume": 42, "muted": "true"}
     with (
         patch.object(ad_replay, "monotonic", return_value=100),
@@ -268,6 +281,165 @@ async def test_replay_restores_owned_mute_with_only_the_seek_needed(reported_pos
     expected.append(("setVolume", {"volume": 42, "muted": "false"}))
     commands.assert_awaited_once_with(expected)
     assert not client._muted_for_ad
+    counted.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_repeated_ad_events_count_once_and_distinct_back_to_back_ads_count_separately():
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
+    with patch.object(client, "_send_command", return_value=True):
+        first = {"adVideoId": "ad-one", "isSkipEnabled": "true"}
+        for _ in range(2):
+            await client._process_event("adPlaying", [first])
+            await asyncio.gather(*client._actions)
+        await client._process_event(
+            "onAdStateChange", [{"adState": "1", "isSkipEnabled": "true", "currentTime": "1"}]
+        )
+        await asyncio.gather(*client._actions)
+        counted.assert_called_once_with()
+
+        await client._process_event("adPlaying", [{"adVideoId": "ad-two", "isSkipEnabled": "true"}])
+        await asyncio.gather(*client._actions)
+        assert counted.call_count == 2
+
+        await client._process_event("onAdStateChange", [{"adState": "1082", "currentTime": "0"}])
+        await client._process_event("adPlaying", [first])
+        await asyncio.gather(*client._actions)
+        assert counted.call_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owned_mute", [False, True])
+async def test_late_skip_ack_counts_its_own_ad_without_marking_next_ad_counted(owned_mute):
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
+    client._muted_for_ad = owned_mute
+    first_sent = asyncio.Event()
+    second_sent = asyncio.Event()
+    finish_first = asyncio.Event()
+    finish_second = asyncio.Event()
+    requests = 0
+
+    async def send(commands):
+        nonlocal requests
+        if commands[0][0] == "skipAd":
+            requests += 1
+            if requests == 1:
+                first_sent.set()
+                await finish_first.wait()
+            else:
+                second_sent.set()
+                await finish_second.wait()
+        return True
+
+    with patch.object(client, "_send_commands", side_effect=send) as transport:
+        try:
+            await client._process_event(
+                "adPlaying", [{"adVideoId": "ad-one", "isSkipEnabled": "true"}]
+            )
+            await asyncio.wait_for(first_sent.wait(), timeout=1)
+            await client._process_event(
+                "adPlaying", [{"adVideoId": "ad-two", "isSkipEnabled": "true"}]
+            )
+            finish_first.set()
+            await asyncio.wait_for(second_sent.wait(), timeout=1)
+            counted.assert_called_once_with()
+            finish_second.set()
+            await asyncio.gather(*client._actions)
+            assert counted.call_count == 2
+            # The first skip already restored any mute held by the integration.
+            assert transport.await_args_list[-1] == call([("skipAd", None)])
+        finally:
+            finish_first.set()
+            finish_second.set()
+            await client.stop_subscription()
+
+
+@pytest.mark.asyncio
+async def test_pre_roll_content_identity_discovery_preserves_counted_ad():
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
+    ad = {"adVideoId": "ad-one", "contentVideoId": "content", "isSkipEnabled": "true"}
+    with patch.object(client, "_send_command", return_value=True):
+        await client._process_event("adPlaying", [ad])
+        await asyncio.gather(*client._actions)
+        counted.assert_called_once_with()
+        await client._process_event(
+            "nowPlaying",
+            [
+                {
+                    "videoId": "content",
+                    "adVideoId": "ad-one",
+                    "state": "1081",
+                    "currentTime": "1",
+                    "duration": "15",
+                }
+            ],
+        )
+        await client._process_event("adPlaying", [ad])
+        await asyncio.gather(*client._actions)
+    counted.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_failed_old_ad_skip_does_not_resume_a_new_ad():
+    client = _client()
+    sent = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def send(command, parameters):
+        sent.set()
+        await finish.wait()
+        return False
+
+    with (
+        patch.object(client, "_send_command", side_effect=send),
+        patch.object(client._ad_replay, "resume_paused_ad", new_callable=AsyncMock) as resume,
+    ):
+        try:
+            await client._process_event(
+                "adPlaying", [{"adVideoId": "old-ad", "isSkipEnabled": "true"}]
+            )
+            await asyncio.wait_for(sent.wait(), timeout=1)
+            await client._process_event(
+                "adPlaying", [{"adVideoId": "new-ad", "isSkipEnabled": "false"}]
+            )
+            finish.set()
+            await asyncio.gather(*client._actions)
+        finally:
+            finish.set()
+            await client.stop_subscription()
+    resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, OSError("Request failed"), asyncio.CancelledError()])
+async def test_unacknowledged_skip_does_not_count(failure):
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
+    send = AsyncMock(**({"return_value": False} if failure is False else {"side_effect": failure}))
+    with patch.object(client, "_send_command", send):
+        await client._process_event("adPlaying", [{"adVideoId": "ad-one", "isSkipEnabled": "true"}])
+        await asyncio.gather(*client._actions, return_exceptions=True)
+    counted.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_ad_ending_without_a_skip_command_does_not_count(disabled):
+    counted = Mock()
+    client = _client(on_ad_skip=counted)
+    client.skip_ads = not disabled
+    with patch.object(client, "_send_command", return_value=True) as send:
+        await client._process_event(
+            "adPlaying", [{"isSkippable": "true", "isSkipEnabled": "true" if disabled else "false"}]
+        )
+        await asyncio.gather(*client._actions)
+        await client._process_event("onAdStateChange", [{"adState": "1082", "currentTime": "0"}])
+        await asyncio.gather(*client._actions)
+    send.assert_not_awaited()
+    counted.assert_not_called()
 
 
 @pytest.mark.asyncio

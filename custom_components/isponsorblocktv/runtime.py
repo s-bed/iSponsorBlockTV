@@ -46,6 +46,8 @@ class PlaybackActivity(TypedDict):
 
     count: int
     last_skip: str | None
+    ad_skip_count: NotRequired[int]
+    last_ad_skip: NotRequired[str | None]
     last_short_disruption: NotRequired[str | None]
 
 
@@ -66,6 +68,8 @@ class TVSnapshot:
     ad_skippable: bool | None = None
     skip_count: int = 0
     last_skip: datetime | None = None
+    ad_skip_count: int = 0
+    last_ad_skip: datetime | None = None
     last_short_disruption: datetime | None = None
     video_id: str | None = None
     duration: float | None = None
@@ -116,6 +120,7 @@ class TVRuntime:
             self._logger,
             web_session=session,
             on_update=self._async_lounge_updated,
+            on_ad_skip=self._async_ad_skipped,
             request_initial_playback=bool(blocked_channels),
         )
         self._scheduler = PlaybackScheduler(
@@ -148,11 +153,14 @@ class TVRuntime:
         """Load saved playback activity before exposing the sensors."""
         if (activity := await self._activity_store.async_load()) is not None:
             last_skip = activity["last_skip"]
+            last_ad_skip = activity.get("last_ad_skip")
             last_short_disruption = activity.get("last_short_disruption")
             self.snapshot = replace(
                 self.snapshot,
                 skip_count=activity["count"],
                 last_skip=datetime.fromisoformat(last_skip) if last_skip else None,
+                ad_skip_count=activity.get("ad_skip_count", 0),
+                last_ad_skip=datetime.fromisoformat(last_ad_skip) if last_ad_skip else None,
                 last_short_disruption=(
                     datetime.fromisoformat(last_short_disruption) if last_short_disruption else None
                 ),
@@ -213,6 +221,13 @@ class TVRuntime:
         self._async_save_activity()
 
     @callback
+    def _async_ad_skipped(self) -> None:
+        self._async_publish(
+            ad_skip_count=self.snapshot.ad_skip_count + 1, last_ad_skip=datetime.now(UTC)
+        )
+        self._async_save_activity()
+
+    @callback
     def _async_short_disrupted(self) -> None:
         self._async_publish(last_short_disruption=datetime.now(UTC))
         self._async_save_activity()
@@ -225,10 +240,13 @@ class TVRuntime:
     @callback
     def _activity_data(self) -> PlaybackActivity:
         last_skip = self.snapshot.last_skip
+        last_ad_skip = self.snapshot.last_ad_skip
         last_short_disruption = self.snapshot.last_short_disruption
         return {
             "count": self.snapshot.skip_count,
             "last_skip": last_skip.isoformat() if last_skip else None,
+            "ad_skip_count": self.snapshot.ad_skip_count,
+            "last_ad_skip": last_ad_skip.isoformat() if last_ad_skip else None,
             "last_short_disruption": (
                 last_short_disruption.isoformat() if last_short_disruption else None
             ),

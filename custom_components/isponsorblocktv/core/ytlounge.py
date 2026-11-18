@@ -39,6 +39,14 @@ class PlaybackState:
     state: State = State.Stopped
 
 
+@dataclass(slots=True)
+class _AdSkipAttempt:
+    """Keep acknowledgment accounting tied to the ad a command targeted."""
+
+    ad_video_id: str | None
+    counted: bool = False
+
+
 def _nonnegative_float(value) -> float | None:
     try:
         number = float(value)
@@ -57,6 +65,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         *,
         web_session: ClientSession | None = None,
         on_update=None,
+        on_ad_skip: Callable[[], None] | None = None,
         request_initial_playback: bool = False,
     ):
         self.logger = logger or _LOGGER
@@ -66,6 +75,8 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         )
         self.session = web_session
         self._on_update = on_update
+        self._on_ad_skip = on_ad_skip
+        self._ad_skip_attempt: _AdSkipAttempt | None = None
         self._request_initial_playback = request_initial_playback
         self.auth.screen_id = screen_id
         self.auth.lounge_id_token = None
@@ -134,6 +145,7 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         self.volume_state = {}
         self.ad_playing = None
         self.ad_skippable = None
+        self._ad_skip_attempt = None
         self._notify_update()
 
     def reset_session(self) -> None:
@@ -162,12 +174,19 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         except TypeError, ValueError, OverflowError:
             state = State.Stopped
         video_id = data.get("videoId", "" if event_type == "nowPlaying" else previous.videoId)
+        ad_video_id = data.get("adVideoId")
+        explicit_ad = bool(ad_video_id) or data.get("adState") in ("1", 1)
+        discovering_ad_content = (
+            not self._ad_replay.video_id
+            and self.ad_playing
+            and (state is State.Advertisement or explicit_ad)
+        )
         if isinstance(video_id, str) and video_id and video_id != self._ad_replay.video_id:
             self._ad_replay.video_changed(video_id)
-            self._set_ad(False, source=event_type)
+            if not discovering_ad_content:
+                self._set_ad(False, source=event_type)
         reported_duration = _nonnegative_float(data.get("duration"))
         inferred_ad = self._ad_replay.looks_like_ad(video_id, reported_duration)
-        explicit_ad = bool(data.get("adVideoId")) or data.get("adState") in ("1", 1)
         continuing_ad = (
             self.ad_playing
             and state is not State.AdSkipped
@@ -179,7 +198,12 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             self._set_ad(False, source=event_type)
         elif inferred_ad or explicit_ad or continuing_ad or state is State.Advertisement:
             state = State.Advertisement
-            self._set_ad(True, self.ad_skippable or False, source=event_type)
+            self._set_ad(
+                True,
+                self.ad_skippable or False,
+                source=event_type,
+                ad_video_id=ad_video_id,
+            )
         elif state in (State.Playing, State.Stopped, State.Buffering, State.AdSkipped):
             self._set_ad(False, source=event_type)
         if not isinstance(video_id, str) or state in (State.Stopped, State.Buffering):
@@ -386,6 +410,16 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 if self._muted_for_ad and await self.mute(False, override=True):
                     self._muted_for_ad = False
             elif self.skip_ads and self.ad_skippable:
+                attempt = self._ad_skip_attempt
+
+                def before_skip():
+                    return (
+                        self._ad_skip_attempt is attempt
+                        and self.ad_playing
+                        and self.ad_skippable
+                        and self.skip_ads
+                    )
+
                 try:
                     if self._muted_for_ad:
                         skipped = await self._commands(
@@ -398,16 +432,20 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                                         "muted": "false",
                                     },
                                 ),
-                            ]
+                            ],
+                            only_if=before_skip,
                         )
                         if skipped:
                             self._muted_for_ad = False
                     else:
-                        skipped = await self.skip_ad()
+                        skipped = await self._command("skipAd", only_if=before_skip)
                 except Exception:
-                    await self._ad_replay.resume_paused_ad()
+                    if self._ad_skip_attempt is attempt:
+                        await self._ad_replay.resume_paused_ad()
                     raise
-                if not skipped:
+                if skipped:
+                    self._record_ad_skip(attempt)
+                elif self._ad_skip_attempt is attempt:
                     await self._ad_replay.resume_paused_ad()
             elif self.mute_ads and self.muted is not True and not self._muted_for_ad:
                 # A disconnect may cancel the response after the command has reached the TV.
@@ -415,10 +453,28 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
                 if not await self.mute(True, override=True):
                     self._muted_for_ad = False
 
-    def _set_ad(self, playing, skippable=False, *, source):
-        if playing and not self.ad_playing:
+    def _record_ad_skip(self, attempt: _AdSkipAttempt | None) -> None:
+        """Count the acknowledged command once even if the next ad has started."""
+        if attempt is None or attempt.counted:
+            return
+        attempt.counted = True
+        if self._on_ad_skip is not None:
+            self._on_ad_skip()
+
+    def _set_ad(self, playing, skippable=False, *, source, ad_video_id=None):
+        ad_video_id = ad_video_id if isinstance(ad_video_id, str) and ad_video_id else None
+        attempt = self._ad_skip_attempt
+        new_ad = playing and (
+            attempt is None
+            or (ad_video_id is not None and attempt.ad_video_id not in (None, ad_video_id))
+        )
+        if new_ad:
+            self._ad_skip_attempt = _AdSkipAttempt(ad_video_id)
             self._ad_replay.ad_started()
+        elif playing and ad_video_id is not None:
+            attempt.ad_video_id = ad_video_id
         elif not playing and self.ad_playing:
+            self._ad_skip_attempt = None
             self._ad_replay.ad_ended()
         if (playing, skippable) != (self.ad_playing, self.ad_skippable):
             self.logger.debug(
@@ -466,7 +522,9 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
             if ad_state == "1082" or (ad_state == "0" and data.get("currentTime") != "0"):
                 self._set_ad(False, source=event_type)
             elif ad_state:
-                self._set_ad(True, skip_enabled, source=event_type)
+                self._set_ad(
+                    True, skip_enabled, source=event_type, ad_video_id=data.get("adVideoId")
+                )
         elif event_type == "onVolumeChanged":
             self.volume_state = data
             self.logger.debug("YouTube onVolumeChanged: muted=%s", self.muted)
@@ -477,7 +535,12 @@ class YtLoungeApi(pyytlounge.YtLoungeApi):
         elif event_type == "adPlaying":
             if self.api_helper and (video_id := data.get("contentVideoId")):
                 self._start_action(self.api_helper.get_segments, video_id)
-            self._set_ad(True, data.get("isSkipEnabled") in ("true", True), source=event_type)
+            self._set_ad(
+                True,
+                data.get("isSkipEnabled") in ("true", True),
+                source=event_type,
+                ad_video_id=data.get("adVideoId"),
+            )
             if (
                 self.skip_ads
                 and data.get("isSkippable") in ("false", False)
